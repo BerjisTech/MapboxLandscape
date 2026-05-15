@@ -1,0 +1,12 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.MapboxLandscape.cpp.obj": [
+			"MapboxLandscape.init.gen.cpp.obj",
+			"MapboxLandscapeActor.gen.cpp.obj",
+			"PerModuleInline.gen.cpp.obj",
+			"MapboxLandscape.cpp.obj",
+			"MapboxLandscapeActor.cpp.obj"
+		]
+	}
+}

@@ -1,0 +1,14 @@
+/NOLOGO
+/errorReport:prompt
+/MACHINE:x64
+/SUBSYSTEM:WINDOWS
+/DEF
+/NAME:"UnrealEditor-MapboxLandscape.dll"
+/IGNORE:4221
+/NODEFAULTLIB
+"F:/Airmuseum/Intermediate/Build/Win64/x64/UnrealEditor/Development/UnrealEd/SharedPCH.UnrealEd.Project.ValApi.ValExpApi.Cpp20.h.obj"
+"F:/Airmuseum/Plugins/MapboxLandscape/Intermediate/Build/Win64/x64/UnrealEditor/Development/MapboxLandscape/Module.MapboxLandscape.cpp.obj"
+"F:/Airmuseum/Plugins/MapboxLandscape/Intermediate/Build/Win64/x64/UnrealEditor/Development/MapboxLandscape/MapboxLandscape.cpp.obj"
+"F:/Airmuseum/Plugins/MapboxLandscape/Intermediate/Build/Win64/x64/UnrealEditor/Development/MapboxLandscape/MapboxLandscapeActor.cpp.obj"
+"F:/Airmuseum/Plugins/MapboxLandscape/Intermediate/Build/Win64/x64/UnrealEditor/Development/MapboxLandscape/Default.rc2.res"
+/OUT:"F:/Airmuseum/Plugins/MapboxLandscape/Intermediate/Build/Win64/x64/UnrealEditor/Development/MapboxLandscape/UnrealEditor-MapboxLandscape.lib"
