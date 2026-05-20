@@ -2,6 +2,7 @@
 
 #include "MapboxAssetGenerator.h"
 #include "MapboxLandscapeSettings.h"
+#include "MapboxMvtReader.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -12,6 +13,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Misc/MessageDialog.h"
 #include "Widgets/Notifications/SNotificationList.h"
@@ -25,8 +27,10 @@
 #include "LandscapeInfo.h"
 #include "LandscapeLayerInfoObject.h"
 #include "LandscapeProxy.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Factories/MaterialInstanceConstantFactoryNew.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
 #include "PCGComponent.h"
@@ -135,46 +139,89 @@ void UMapboxImporterConfig::EnsureDefaultLayers()
 {
 	if (!MapboxLayers.IsEmpty()) return;
 
-	FMapboxLayerDef Forest;
-	Forest.LayerName = TEXT("Forest");
-	Forest.TargetColor = FLinearColor(0.30f, 0.55f, 0.20f);
-	Forest.MaterialTint = FLinearColor(0.20f, 0.45f, 0.15f);
-	Forest.Priority = 30;
-	Forest.ScatterDensity = 4.f;
+	auto MakeVectorLayer = [](FName Name, const FString& MvtLayer, const TArray<FString>& Classes,
+		float LineWidth, int32 Priority, FLinearColor Tint, bool bScatter = false, float Density = 0.f) -> FMapboxLayerDef
+	{
+		FMapboxLayerDef L;
+		L.LayerName = Name;
+		L.MatchMode = EMapboxLayerMatchMode::Vector;
+		L.Priority = Priority;
+		L.MaterialTint = Tint;
+		L.bScatterEnabled = bScatter;
+		L.ScatterDensity = Density;
 
+		FMapboxVectorFeatureFilter F;
+		F.MvtLayer = MvtLayer;
+		F.Classes = Classes;
+		F.LineWidthMeters = LineWidth;
+		L.VectorFilters.Add(F);
+		return L;
+	};
+
+	// Polygons (priority highest — buildings/water override everything else)
+	FMapboxLayerDef Water = MakeVectorLayer(TEXT("Water"), TEXT("water"), {}, 0.f, 90,
+		FLinearColor(0.10f, 0.25f, 0.45f));
+
+	FMapboxLayerDef Building = MakeVectorLayer(TEXT("Buildings"), TEXT("building"), {}, 0.f, 80,
+		FLinearColor(0.4f, 0.38f, 0.35f));
+
+	// Airport surfaces
+	FMapboxLayerDef Runway = MakeVectorLayer(TEXT("Runway"), TEXT("aeroway"),
+		{ TEXT("runway") }, 45.f, 75, FLinearColor(0.18f, 0.18f, 0.20f));
+
+	FMapboxLayerDef Taxiway = MakeVectorLayer(TEXT("Taxiway"), TEXT("aeroway"),
+		{ TEXT("taxiway") }, 18.f, 72, FLinearColor(0.22f, 0.22f, 0.22f));
+
+	// Road network — graded by class so highways look different from footpaths
+	FMapboxLayerDef Highway = MakeVectorLayer(TEXT("Highway"), TEXT("road"),
+		{ TEXT("motorway"), TEXT("motorway_link"), TEXT("trunk"), TEXT("trunk_link") },
+		15.f, 60, FLinearColor(0.25f, 0.25f, 0.27f));
+
+	FMapboxLayerDef Primary = MakeVectorLayer(TEXT("PrimaryRoad"), TEXT("road"),
+		{ TEXT("primary"), TEXT("primary_link"), TEXT("secondary"), TEXT("secondary_link") },
+		10.f, 55, FLinearColor(0.32f, 0.32f, 0.34f));
+
+	FMapboxLayerDef Tertiary = MakeVectorLayer(TEXT("TertiaryRoad"), TEXT("road"),
+		{ TEXT("tertiary"), TEXT("tertiary_link"), TEXT("street") },
+		7.f, 50, FLinearColor(0.38f, 0.38f, 0.40f));
+
+	FMapboxLayerDef Residential = MakeVectorLayer(TEXT("ResidentialRoad"), TEXT("road"),
+		{ TEXT("street_limited"), TEXT("service"), TEXT("track") },
+		5.f, 45, FLinearColor(0.45f, 0.45f, 0.47f));
+
+	FMapboxLayerDef Path = MakeVectorLayer(TEXT("Path"), TEXT("road"),
+		{ TEXT("path"), TEXT("footway"), TEXT("pedestrian"), TEXT("steps") },
+		2.f, 40, FLinearColor(0.55f, 0.48f, 0.35f));
+
+	FMapboxLayerDef Railway = MakeVectorLayer(TEXT("Railway"), TEXT("road"),
+		{ TEXT("major_rail"), TEXT("minor_rail"), TEXT("service_rail") },
+		4.f, 52, FLinearColor(0.20f, 0.20f, 0.22f));
+
+	// Landuse polygons — drive vegetation scatter
+	FMapboxLayerDef Forest = MakeVectorLayer(TEXT("Forest"), TEXT("landuse"),
+		{ TEXT("wood"), TEXT("forest") },
+		0.f, 30, FLinearColor(0.20f, 0.45f, 0.15f), /*bScatter=*/true, /*density=*/4.f);
+
+	FMapboxLayerDef Park = MakeVectorLayer(TEXT("Park"), TEXT("landuse"),
+		{ TEXT("park"), TEXT("pitch"), TEXT("garden") },
+		0.f, 28, FLinearColor(0.35f, 0.55f, 0.30f), /*bScatter=*/true, /*density=*/8.f);
+
+	FMapboxLayerDef Industrial = MakeVectorLayer(TEXT("Industrial"), TEXT("landuse"),
+		{ TEXT("industrial"), TEXT("commercial"), TEXT("parking") },
+		0.f, 25, FLinearColor(0.45f, 0.45f, 0.42f));
+
+	// Color fallback — catches everything else as grass
 	FMapboxLayerDef Grass;
 	Grass.LayerName = TEXT("Grass");
+	Grass.MatchMode = EMapboxLayerMatchMode::Color;
 	Grass.TargetColor = FLinearColor(0.55f, 0.70f, 0.30f);
 	Grass.MaterialTint = FLinearColor(0.45f, 0.55f, 0.25f);
-	Grass.Priority = 20;
+	Grass.Priority = 10;
+	Grass.bScatterEnabled = true;
 	Grass.ScatterDensity = 12.f;
 
-	FMapboxLayerDef Urban;
-	Urban.LayerName = TEXT("Urban");
-	Urban.TargetColor = FLinearColor(0.65f, 0.65f, 0.65f);
-	Urban.ColorSpace = EMapboxColorSpace::HSV;
-	Urban.SatTolerance = 0.15f;
-	Urban.MaterialTint = FLinearColor(0.5f, 0.5f, 0.5f);
-	Urban.Priority = 40;
-	Urban.bScatterEnabled = false;
-
-	FMapboxLayerDef Road;
-	Road.LayerName = TEXT("Road");
-	Road.TargetColor = FLinearColor(0.85f, 0.85f, 0.85f);
-	Road.ColorSpace = EMapboxColorSpace::HSV;
-	Road.SatTolerance = 0.1f;
-	Road.MaterialTint = FLinearColor(0.3f, 0.3f, 0.3f);
-	Road.Priority = 50;
-	Road.bScatterEnabled = false;
-
-	FMapboxLayerDef Water;
-	Water.LayerName = TEXT("Water");
-	Water.TargetColor = FLinearColor(0.20f, 0.40f, 0.65f);
-	Water.MaterialTint = FLinearColor(0.10f, 0.25f, 0.45f);
-	Water.Priority = 60;
-	Water.bScatterEnabled = false;
-
-	MapboxLayers = { Forest, Grass, Urban, Road, Water };
+	MapboxLayers = { Water, Building, Runway, Taxiway, Highway, Primary, Tertiary,
+		Residential, Path, Railway, Forest, Park, Industrial, Grass };
 }
 
 void UMapboxImporterConfig::ResetLayersToDefaults()
@@ -200,7 +247,7 @@ void UMapboxImporterConfig::RegenerateDefaultAssets()
 #if WITH_EDITOR
 	TArray<FName> Names;
 	for (const FMapboxLayerDef& L : MapboxLayers) { Names.Add(L.LayerName); }
-	MapboxAssetGenerator::GetOrCreateDefaultMasterMaterial(Names);
+	MapboxAssetGenerator::GetOrCreateDefaultMasterMaterial(Names, /*bForceRecreate=*/true);
 	MapboxAssetGenerator::GetOrCreateDefaultScatterGraph();
 	UE_LOG(LogMapbox, Log, TEXT("Mapbox default assets regenerated."));
 #endif
@@ -210,6 +257,136 @@ FString UMapboxImporterConfig::GetApiKey()
 {
 	const UMapboxLandscapeSettings* Settings = GetDefault<UMapboxLandscapeSettings>();
 	return Settings ? Settings->ApiKey : FString();
+}
+
+void UMapboxImporterConfig::FixExistingLandscapeMaterials()
+{
+#if WITH_EDITOR
+	// Build the working set: in-memory GeneratedLandscapes plus any "MapboxLandscape_C*" actors
+	// in the current editor world. The level scan is what makes this work after editor restart
+	// (the importer config is transient and forgets refs between sessions).
+	TSet<TObjectPtr<ALandscape>> Working;
+	for (const FMapboxTileResult& T : GeneratedLandscapes)
+	{
+		if (IsValid(T.Landscape)) Working.Add(T.Landscape);
+	}
+
+	UWorld* World = GetWorld();
+	if (World)
+	{
+		for (TActorIterator<ALandscape> It(World); It; ++It)
+		{
+			ALandscape* L = *It;
+			if (!IsValid(L)) continue;
+			const FString Label = L->GetActorLabel();
+			const FString Name = L->GetName();
+			if (Label.StartsWith(TEXT("MapboxLandscape_")) || Name.StartsWith(TEXT("MapboxLandscape_")))
+			{
+				Working.Add(L);
+			}
+		}
+	}
+
+	if (Working.IsEmpty())
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			TEXT("Mapbox: no landscapes to fix."),
+			TEXT("Couldn't find any 'MapboxLandscape_C*' actors in this level. If the landscapes were renamed, rename one back to that prefix and try again, or just re-fetch."));
+		return;
+	}
+
+	// 1. Rebuild master material with the latest UV graph.
+	TArray<FName> Names;
+	for (const FMapboxLayerDef& L : MapboxLayers) { Names.Add(L.LayerName); }
+	UMaterialInterface* Master = MapboxAssetGenerator::GetOrCreateDefaultMasterMaterial(Names, /*bForceRecreate=*/true);
+	if (!Master)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox: failed to rebuild master material."),
+			TEXT("Check the Output Log."));
+		return;
+	}
+
+	// 2. Recompute each landscape's origin/size from its actor transform, rebuild its MIC, reassign.
+	int32 Fixed = 0;
+	int32 ChunkIdx = 0;
+	for (ALandscape* Landscape : Working)
+	{
+		if (!IsValid(Landscape)) continue;
+
+		const FVector ChunkOrigin = Landscape->GetActorLocation();
+		const FBox Bounds = Landscape->GetComponentsBoundingBox(true);
+		const double WorldSizeX = Bounds.Max.X - Bounds.Min.X;
+		const double WorldSizeY = Bounds.Max.Y - Bounds.Min.Y;
+		const double WorldSize = FMath::Max(WorldSizeX, WorldSizeY);
+		if (WorldSize < 100.0)
+		{
+			UE_LOG(LogMapbox, Warning, TEXT("Mapbox: %s has unexpectedly small bounds (%.0f cm), skipping."),
+				*Landscape->GetActorLabel(), WorldSize);
+			continue;
+		}
+
+		// Try to derive ChunkX/ChunkY from the actor name; fall back to a counter so each MIC gets a unique path.
+		int32 ChunkX = ChunkIdx, ChunkY = 0;
+		{
+			const FString Name = Landscape->GetName();
+			int32 UnderscoreC = INDEX_NONE;
+			if (Name.FindLastChar(TCHAR('C'), UnderscoreC))
+			{
+				const FString TailFromC = Name.Mid(UnderscoreC + 1);
+				TArray<FString> Parts;
+				TailFromC.ParseIntoArray(Parts, TEXT("_"), true);
+				if (Parts.Num() >= 2)
+				{
+					ChunkX = FCString::Atoi(*Parts[0]);
+					ChunkY = FCString::Atoi(*Parts[1]);
+				}
+			}
+		}
+
+		// Re-resolve the chunk's satellite texture. Looking it up through the current MIC fails after
+		// a forced master rebuild (the param table just changed), so we go straight to the asset on disk.
+		// Files were saved as /Game/MapboxLandscape/Textures/T_MapboxSat_C{X}_{Y}_Z{Z}; zoom is unknown
+		// here, so we scan the folder for any matching X/Y.
+		UTexture2D* SatTexture = nullptr;
+		{
+			const FString Prefix = FString::Printf(TEXT("T_MapboxSat_C%d_%d_Z"), ChunkX, ChunkY);
+
+			IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+			TArray<FAssetData> AssetsInFolder;
+			AssetRegistry.GetAssetsByPath(FName(TEXT("/Game/MapboxLandscape/Textures")), AssetsInFolder, /*bRecursive=*/false);
+
+			for (const FAssetData& Asset : AssetsInFolder)
+			{
+				if (Asset.AssetName.ToString().StartsWith(Prefix))
+				{
+					SatTexture = Cast<UTexture2D>(Asset.GetAsset());
+					if (SatTexture) break;
+				}
+			}
+
+			if (!SatTexture)
+			{
+				UE_LOG(LogMapbox, Warning, TEXT("Mapbox: %s has no matching T_MapboxSat_C%d_%d_Z* in /Game/MapboxLandscape/Textures/. Material will render with default texture."),
+					*Landscape->GetActorLabel(), ChunkX, ChunkY);
+			}
+		}
+
+		UMaterialInstanceConstant* MIC = CreateMaterialInstanceForChunk(
+			Master, SatTexture, ChunkX, ChunkY, ChunkOrigin, WorldSize);
+		if (MIC)
+		{
+			Landscape->LandscapeMaterial = MIC;
+			Landscape->PostEditChange();
+			Landscape->ReregisterAllComponents();
+			++Fixed;
+		}
+		++ChunkIdx;
+	}
+
+	MapboxUI::Notify(MapboxUI::ESeverity::Success,
+		FString::Printf(TEXT("Mapbox: fixed materials on %d landscape(s)."), Fixed));
+#endif
 }
 
 void UMapboxImporterConfig::ResetFromProjectSettings()
@@ -274,6 +451,19 @@ static double MetersPerTileSide(double Lat, int32 Z)
 {
 	const double EarthCirc = 40075016.686;
 	return EarthCirc * FMath::Cos(FMath::DegreesToRadians(Lat)) / FMath::Pow(2.0, Z);
+}
+
+// Returns true if any layer requires Mapbox vector tiles (one with MatchMode != Color and at least one filter).
+static bool LayersNeedVectorTiles(const TArray<FMapboxLayerDef>& Layers)
+{
+	for (const FMapboxLayerDef& L : Layers)
+	{
+		if (L.MatchMode != EMapboxLayerMatchMode::Color && !L.VectorFilters.IsEmpty())
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 // ----- Bounding box resolution ------------------------------------------------
@@ -355,8 +545,9 @@ void UMapboxImporterConfig::EnumerateTiles(double N, double S, double E, double 
 		}
 	}
 
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 	TotalExpectedBlobs = (MaxTileX - MinTileX + 1) * (MaxTileY - MinTileY + 1) *
-		(2 + (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0));
+		(2 + (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0) + (bNeedVector ? 1 : 0));
 
 	// Build chunks
 	Chunks.Reset();
@@ -453,6 +644,8 @@ void UMapboxImporterConfig::FetchLandscape()
 
 void UMapboxImporterConfig::StartNextDownloads()
 {
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+
 	while (InFlightRequests < MaxConcurrentRequests && PendingDownloadQueue.Num() > 0)
 	{
 		FTileCoord Coord = PendingDownloadQueue.Pop(EAllowShrinking::No);
@@ -461,6 +654,10 @@ void UMapboxImporterConfig::StartNextDownloads()
 		if (SatelliteMode != EMapboxSatelliteMode::None)
 		{
 			StartRequest(Coord, ETileKind::Satellite);
+		}
+		if (bNeedVector)
+		{
+			StartRequest(Coord, ETileKind::Vector);
 		}
 	}
 
@@ -488,6 +685,10 @@ void UMapboxImporterConfig::StartRequest(const FTileCoord& Coord, ETileKind Kind
 		Url = FString::Printf(TEXT("https://api.mapbox.com/v4/mapbox.satellite/%d/%d/%d.png?access_token=%s"),
 			Coord.Z, Coord.X, Coord.Y, *GetApiKey());
 		break;
+	case ETileKind::Vector:
+		Url = FString::Printf(TEXT("https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/%d/%d/%d.mvt?access_token=%s"),
+			Coord.Z, Coord.X, Coord.Y, *GetApiKey());
+		break;
 	}
 
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
@@ -503,6 +704,7 @@ static FString KeyFor(int32 X, int32 Y, UMapboxImporterConfig::ETileKind Kind)
 	const TCHAR* K = TEXT("h");
 	if (Kind == UMapboxImporterConfig::ETileKind::Metadata) K = TEXT("m");
 	else if (Kind == UMapboxImporterConfig::ETileKind::Satellite) K = TEXT("s");
+	else if (Kind == UMapboxImporterConfig::ETileKind::Vector) K = TEXT("v");
 	return FString::Printf(TEXT("%s_%d_%d"), K, X, Y);
 }
 
@@ -675,6 +877,78 @@ UMaterialInterface* UMapboxImporterConfig::GetOrGenerateMasterMaterial()
 #endif
 }
 
+UMaterialInstanceConstant* UMapboxImporterConfig::CreateMaterialInstanceForChunk(
+	UMaterialInterface* Master, UTexture2D* SatelliteTexture, int32 ChunkX, int32 ChunkY,
+	FVector LandscapeOriginCm, double LandscapeWorldSizeCm) const
+{
+#if WITH_EDITOR
+	if (!Master) return nullptr;
+
+	const FString AssetName = FString::Printf(TEXT("MI_MapboxLandscape_C%d_%d"), ChunkX, ChunkY);
+	const FString PackagePath = FString::Printf(TEXT("/Game/MapboxLandscape/MaterialInstances/%s"), *AssetName);
+
+	UPackage* Package = CreatePackage(*PackagePath);
+	if (!Package) return nullptr;
+	Package->FullyLoad();
+
+	// If an instance with this name already exists from a prior fetch, overwrite its parameter values instead of creating a duplicate.
+	UMaterialInstanceConstant* MIC = FindObject<UMaterialInstanceConstant>(Package, *AssetName);
+	if (!MIC)
+	{
+		UMaterialInstanceConstantFactoryNew* Factory = NewObject<UMaterialInstanceConstantFactoryNew>();
+		Factory->InitialParent = Master;
+		MIC = Cast<UMaterialInstanceConstant>(Factory->FactoryCreateNew(
+			UMaterialInstanceConstant::StaticClass(), Package, *AssetName, RF_Public | RF_Standalone, nullptr, GWarn));
+		if (MIC)
+		{
+			FAssetRegistryModule::AssetCreated(MIC);
+		}
+	}
+	else
+	{
+		MIC->SetParentEditorOnly(Master);
+	}
+
+	if (!MIC) return nullptr;
+
+	if (SatelliteTexture)
+	{
+		MIC->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(TEXT("SatelliteTexture")), SatelliteTexture);
+		MIC->SetScalarParameterValueEditorOnly(FMaterialParameterInfo(TEXT("SatelliteStrength")),
+			SatelliteMode == EMapboxSatelliteMode::BlendIntoMaterial ? 1.f : 0.f);
+	}
+
+	// UV mapping: BaseColor UVs are (WorldPos.xy - LandscapeOrigin.xy) / LandscapeWorldSize.
+	// Stash the chunk's world XY origin and side length so the master's WorldPosition graph maps the texture exactly once.
+	MIC->SetVectorParameterValueEditorOnly(FMaterialParameterInfo(TEXT("LandscapeOrigin")),
+		FLinearColor((float)LandscapeOriginCm.X, (float)LandscapeOriginCm.Y, 0.f, 0.f));
+	MIC->SetScalarParameterValueEditorOnly(FMaterialParameterInfo(TEXT("LandscapeWorldSize")),
+		(float)LandscapeWorldSizeCm);
+
+	for (const FMapboxLayerDef& L : MapboxLayers)
+	{
+		const FName Param(*FString::Printf(TEXT("%s_Tint"), *L.LayerName.ToString()));
+		MIC->SetVectorParameterValueEditorOnly(FMaterialParameterInfo(Param), L.MaterialTint);
+	}
+
+	MIC->PreEditChange(nullptr);
+	MIC->PostEditChange();
+	MIC->MarkPackageDirty();
+
+	const FString Filename = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	UPackage::SavePackage(Package, MIC, *Filename, SaveArgs);
+
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: MIC %s, origin=(%.0f, %.0f) size=%.0fcm%s"),
+		*PackagePath, LandscapeOriginCm.X, LandscapeOriginCm.Y, LandscapeWorldSizeCm,
+		SatelliteTexture ? TEXT("") : TEXT(" [no satellite]"));
+	return MIC;
+#else
+	return nullptr;
+#endif
+}
+
 UPCGGraphInterface* UMapboxImporterConfig::GetOrGenerateScatterGraph()
 {
 	if (UPCGGraphInterface* Set = ScatterPCGGraph.LoadSynchronous())
@@ -744,6 +1018,111 @@ static int32 PickValidLandscapeSize(int32 Desired, int32 SectionSize = 63)
 {
 	const int32 Components = FMath::Max(1, FMath::RoundToInt((float)(Desired - 1) / SectionSize));
 	return Components * SectionSize + 1;
+}
+
+// ---------- MVT rasterization helpers ----------
+
+// Stamps a filled square brush centered at (cx, cy) with given radius into the mask.
+static FORCEINLINE void StampBrush(TArray<uint8>& Mask, int32 W, int32 H, int32 Cx, int32 Cy, int32 Radius)
+{
+	const int32 X0 = FMath::Clamp(Cx - Radius, 0, W - 1);
+	const int32 X1 = FMath::Clamp(Cx + Radius, 0, W - 1);
+	const int32 Y0 = FMath::Clamp(Cy - Radius, 0, H - 1);
+	const int32 Y1 = FMath::Clamp(Cy + Radius, 0, H - 1);
+	for (int32 Y = Y0; Y <= Y1; ++Y)
+	{
+		uint8* Row = Mask.GetData() + Y * W;
+		for (int32 X = X0; X <= X1; ++X)
+		{
+			Row[X] = 255;
+		}
+	}
+}
+
+// Bresenham line with thickness (brush radius). Coordinates are mask pixels.
+static void RasterLine(TArray<uint8>& Mask, int32 W, int32 H,
+                        int32 X0, int32 Y0, int32 X1, int32 Y1, int32 BrushRadius)
+{
+	int32 Dx = FMath::Abs(X1 - X0);
+	int32 Dy = -FMath::Abs(Y1 - Y0);
+	int32 Sx = X0 < X1 ? 1 : -1;
+	int32 Sy = Y0 < Y1 ? 1 : -1;
+	int32 Err = Dx + Dy;
+	int32 X = X0, Y = Y0;
+	while (true)
+	{
+		StampBrush(Mask, W, H, X, Y, BrushRadius);
+		if (X == X1 && Y == Y1) break;
+		const int32 E2 = 2 * Err;
+		if (E2 >= Dy) { Err += Dy; X += Sx; }
+		if (E2 <= Dx) { Err += Dx; Y += Sy; }
+	}
+}
+
+// Scanline polygon fill (even-odd rule). Handles multiple rings via separate calls + XOR semantics.
+// Nearest-neighbor uint8 mask resampling.
+static void ResampleMask(const TArray<uint8>& Src, int32 SrcW, int32 SrcH,
+                          TArray<uint8>& Dst, int32 DstW, int32 DstH)
+{
+	Dst.SetNumZeroed(DstW * DstH);
+	const float SX = (float)SrcW / FMath::Max(1, DstW);
+	const float SY = (float)SrcH / FMath::Max(1, DstH);
+	for (int32 y = 0; y < DstH; ++y)
+	{
+		const int32 sy = FMath::Clamp((int32)(y * SY), 0, SrcH - 1);
+		for (int32 x = 0; x < DstW; ++x)
+		{
+			const int32 sx = FMath::Clamp((int32)(x * SX), 0, SrcW - 1);
+			Dst[y * DstW + x] = Src[sy * SrcW + sx];
+		}
+	}
+}
+
+static void RasterPolygonRing(TArray<uint8>& Mask, int32 W, int32 H, const TArray<FVector2D>& Ring)
+{
+	if (Ring.Num() < 3) return;
+
+	int32 MinY = FMath::FloorToInt(Ring[0].Y);
+	int32 MaxY = MinY;
+	for (const FVector2D& P : Ring)
+	{
+		MinY = FMath::Min(MinY, FMath::FloorToInt(P.Y));
+		MaxY = FMath::Max(MaxY, FMath::CeilToInt(P.Y));
+	}
+	MinY = FMath::Clamp(MinY, 0, H - 1);
+	MaxY = FMath::Clamp(MaxY, 0, H - 1);
+
+	TArray<float> XIntersections;
+	XIntersections.Reserve(Ring.Num());
+
+	for (int32 Y = MinY; Y <= MaxY; ++Y)
+	{
+		const float Fy = (float)Y + 0.5f;
+		XIntersections.Reset();
+
+		for (int32 i = 0, j = Ring.Num() - 1; i < Ring.Num(); j = i++)
+		{
+			const FVector2D& A = Ring[j];
+			const FVector2D& B = Ring[i];
+			if ((A.Y <= Fy && B.Y > Fy) || (B.Y <= Fy && A.Y > Fy))
+			{
+				const float T = (Fy - A.Y) / (B.Y - A.Y);
+				XIntersections.Add(A.X + T * (B.X - A.X));
+			}
+		}
+
+		XIntersections.Sort();
+		for (int32 i = 0; i + 1 < XIntersections.Num(); i += 2)
+		{
+			const int32 X0 = FMath::Clamp(FMath::FloorToInt(XIntersections[i]), 0, W - 1);
+			const int32 X1 = FMath::Clamp(FMath::CeilToInt(XIntersections[i + 1]), 0, W - 1);
+			uint8* Row = Mask.GetData() + Y * W;
+			for (int32 X = X0; X <= X1; ++X)
+			{
+				Row[X] = 255;
+			}
+		}
+	}
 }
 
 void UMapboxImporterConfig::OnAllTilesDownloaded()
@@ -890,18 +1269,151 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			Heightmap[i] = (uint16)FMath::Clamp(FMath::RoundToInt(Val), 0, 65535);
 		}
 
-		// Per-layer weightmaps from classification
+		// Rasterize matching MVT features into source-resolution per-layer masks.
+		// SrcVectorMasks[i] is populated only for layers whose MatchMode != Color.
+		TArray<TArray<uint8>> SrcVectorMasks;
+		SrcVectorMasks.SetNum(MapboxLayers.Num());
+		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
+		{
+			if (MapboxLayers[i].MatchMode != EMapboxLayerMatchMode::Color && !MapboxLayers[i].VectorFilters.IsEmpty())
+			{
+				SrcVectorMasks[i].SetNumZeroed(SrcW * SrcH);
+			}
+		}
+
+		if (LayersNeedVectorTiles(MapboxLayers))
+		{
+			const double MetersPerSrcPixel = TileSideMeters / 256.0;
+			for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
+			for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
+			{
+				const int32 TileX = Chunk.MinTileX + tx;
+				const int32 TileY = Chunk.MinTileY + ty;
+				const int32 BaseX = tx * 256;
+				const int32 BaseY = ty * 256;
+
+				FTileBlob* Blob = CompletedBlobs.Find(KeyFor(TileX, TileY, ETileKind::Vector));
+				if (!Blob || !Blob->bOk) continue;
+
+				TArray<MapboxMvt::FLayer> MvtLayers;
+				if (!MapboxMvt::ParseTile(Blob->Bytes, MvtLayers)) continue;
+
+				for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+				{
+					// For each of our config layers using vector matching, check filters
+					for (int32 LayerIdx = 0; LayerIdx < MapboxLayers.Num(); ++LayerIdx)
+					{
+						const FMapboxLayerDef& L = MapboxLayers[LayerIdx];
+						if (L.MatchMode == EMapboxLayerMatchMode::Color) continue;
+
+						for (const FMapboxVectorFeatureFilter& Filter : L.VectorFilters)
+						{
+							if (!Filter.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
+
+							const float ExtentToPixels = 256.f / FMath::Max(1.f, (float)MvtLayer.Extent);
+							const int32 BrushRadius = FMath::Max(0,
+								FMath::CeilToInt(Filter.LineWidthMeters / FMath::Max(MetersPerSrcPixel, 0.01) / 2.0));
+
+							for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+							{
+								if (!MapboxMvt::FeatureMatchesClass(Feature, Filter.Classes)) continue;
+
+								if (Feature.Type == MapboxMvt::EFeatureType::LineString)
+								{
+									for (const TArray<FVector2D>& Line : Feature.Geometry)
+									{
+										if (Line.Num() < 2) continue;
+										int32 PrevX = BaseX + (int32)(Line[0].X * ExtentToPixels);
+										int32 PrevY = BaseY + (int32)(Line[0].Y * ExtentToPixels);
+										for (int32 p = 1; p < Line.Num(); ++p)
+										{
+											const int32 CurX = BaseX + (int32)(Line[p].X * ExtentToPixels);
+											const int32 CurY = BaseY + (int32)(Line[p].Y * ExtentToPixels);
+											RasterLine(SrcVectorMasks[LayerIdx], SrcW, SrcH, PrevX, PrevY, CurX, CurY, BrushRadius);
+											PrevX = CurX; PrevY = CurY;
+										}
+									}
+								}
+								else if (Feature.Type == MapboxMvt::EFeatureType::Polygon)
+								{
+									for (const TArray<FVector2D>& Ring : Feature.Geometry)
+									{
+										TArray<FVector2D> Transformed;
+										Transformed.Reserve(Ring.Num());
+										for (const FVector2D& P : Ring)
+										{
+											Transformed.Add(FVector2D(BaseX + P.X * ExtentToPixels,
+												BaseY + P.Y * ExtentToPixels));
+										}
+										RasterPolygonRing(SrcVectorMasks[LayerIdx], SrcW, SrcH, Transformed);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Resample SrcVectorMasks down to landscape resolution
+		TArray<TArray<uint8>> ResampledVectorMasks;
+		ResampledVectorMasks.SetNum(MapboxLayers.Num());
+		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
+		{
+			if (SrcVectorMasks[i].Num() > 0)
+			{
+				ResampleMask(SrcVectorMasks[i], SrcW, SrcH, ResampledVectorMasks[i], LandscapeVerts, LandscapeVerts);
+			}
+		}
+
+		// Build per-layer weightmaps with priority-based merge of color and vector matches.
 		TMap<FName, TArray<uint8>> LayerWeights;
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
 			LayerWeights.Add(L.LayerName).SetNumZeroed(LandscapeVerts * LandscapeVerts);
 		}
-		for (int32 i = 0; i < ResampledMeta.Num(); ++i)
+
+		const int32 PixelCount = LandscapeVerts * LandscapeVerts;
+		TArray<int32> WinnerLayer; WinnerLayer.Init(INDEX_NONE, PixelCount);
+		TArray<int32> WinnerPriority; WinnerPriority.Init(-1, PixelCount);
+
+		// Color candidates
+		for (int32 i = 0; i < PixelCount; ++i)
 		{
-			const int32 LayerIdx = ClassifyPixel(ResampledMeta[i]);
-			if (LayerIdx != INDEX_NONE)
+			const int32 ColorIdx = ClassifyPixel(ResampledMeta[i]);
+			if (ColorIdx != INDEX_NONE)
 			{
-				LayerWeights[MapboxLayers[LayerIdx].LayerName][i] = 255;
+				const FMapboxLayerDef& L = MapboxLayers[ColorIdx];
+				if (L.MatchMode != EMapboxLayerMatchMode::Vector && L.Priority > WinnerPriority[i])
+				{
+					WinnerPriority[i] = L.Priority;
+					WinnerLayer[i] = ColorIdx;
+				}
+			}
+		}
+
+		// Vector candidates
+		for (int32 LayerIdx = 0; LayerIdx < MapboxLayers.Num(); ++LayerIdx)
+		{
+			const TArray<uint8>& M = ResampledVectorMasks[LayerIdx];
+			if (M.Num() == 0) continue;
+			const FMapboxLayerDef& L = MapboxLayers[LayerIdx];
+			for (int32 i = 0; i < PixelCount; ++i)
+			{
+				if (M[i] >= 128 && L.Priority > WinnerPriority[i])
+				{
+					WinnerPriority[i] = L.Priority;
+					WinnerLayer[i] = LayerIdx;
+				}
+			}
+		}
+
+		// Write winners to layer weight maps
+		for (int32 i = 0; i < PixelCount; ++i)
+		{
+			if (WinnerLayer[i] != INDEX_NONE)
+			{
+				LayerWeights[MapboxLayers[WinnerLayer[i]].LayerName][i] = 255;
 			}
 		}
 
@@ -984,7 +1496,8 @@ ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk&
 	Landscape->SetActorTransform(FTransform(FRotator::ZeroRotator, ChunkOrigin,
 		FVector(XYScale, XYScale, LandscapeZScale)));
 
-	// Material
+	// Material — use a saved UMaterialInstanceConstant (not UMaterialInstanceDynamic) so it
+	// persists across editor restarts and gets properly shader-compiled before we use it.
 	UMaterialInterface* Master = GetOrGenerateMasterMaterial();
 	if (!Master)
 	{
@@ -992,32 +1505,9 @@ ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk&
 	}
 	else if (SatelliteMode == EMapboxSatelliteMode::BlendIntoMaterial)
 	{
-		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Master, Landscape);
-		if (MID)
-		{
-			if (SatelliteTexture)
-			{
-				MID->SetTextureParameterValue(TEXT("SatelliteTexture"), SatelliteTexture);
-				MID->SetScalarParameterValue(TEXT("SatelliteStrength"), 1.f);
-				UE_LOG(LogMapbox, Log, TEXT("Mapbox: bound satellite texture %s to landscape material."),
-					*SatelliteTexture->GetName());
-			}
-			else
-			{
-				UE_LOG(LogMapbox, Warning, TEXT("Mapbox: satellite texture is null for chunk (%d,%d); landscape will show base color only."),
-					Chunk.ChunkX, Chunk.ChunkY);
-			}
-			for (const FMapboxLayerDef& L : MapboxLayers)
-			{
-				MID->SetVectorParameterValue(FName(*FString::Printf(TEXT("%s_Tint"), *L.LayerName.ToString())),
-					L.MaterialTint);
-			}
-			Landscape->LandscapeMaterial = MID;
-		}
-		else
-		{
-			UE_LOG(LogMapbox, Error, TEXT("Mapbox: failed to create MaterialInstanceDynamic from %s."), *Master->GetName());
-		}
+		UMaterialInstanceConstant* MIC = CreateMaterialInstanceForChunk(Master, SatelliteTexture,
+			Chunk.ChunkX, Chunk.ChunkY, ChunkOrigin, WorldSizePerLandscapeCm);
+		Landscape->LandscapeMaterial = MIC ? Cast<UMaterialInterface>(MIC) : Master;
 	}
 	else
 	{
@@ -1076,6 +1566,10 @@ ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk&
 	{
 		LandscapeInfo->UpdateLayerInfoMap(Landscape);
 	}
+
+	// Force the landscape and its components to pick up the assigned material now.
+	Landscape->PostEditChange();
+	Landscape->ReregisterAllComponents();
 #endif
 
 	return Landscape;

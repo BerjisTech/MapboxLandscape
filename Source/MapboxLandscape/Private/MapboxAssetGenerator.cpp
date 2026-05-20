@@ -5,10 +5,16 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Interfaces/IPluginManager.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionDivide.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialExpressionVectorParameter.h"
+#include "Materials/MaterialExpressionWorldPosition.h"
 #include "Misc/PackageName.h"
+#include "ObjectTools.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
 
@@ -73,13 +79,25 @@ namespace MapboxAssetGenerator
 		return bSaved;
 	}
 
-	UMaterialInterface* GetOrCreateDefaultMasterMaterial(const TArray<FName>& /*LayerNames*/)
+	UMaterialInterface* GetOrCreateDefaultMasterMaterial(const TArray<FName>& /*LayerNames*/, bool bForceRecreate)
 	{
 		const FString AssetPath = GetMasterMaterialAssetPath();
 
-		if (UMaterial* Existing = LoadObject<UMaterial>(nullptr, *AssetPath))
+		if (!bForceRecreate)
 		{
-			return Existing;
+			if (UMaterial* Existing = LoadObject<UMaterial>(nullptr, *AssetPath))
+			{
+				return Existing;
+			}
+		}
+		else
+		{
+			// Delete the stale material so we don't accumulate _NN suffix duplicates.
+			if (UMaterial* Existing = LoadObject<UMaterial>(nullptr, *AssetPath))
+			{
+				TArray<UObject*> ToDelete = { Existing };
+				ObjectTools::ForceDeleteObjects(ToDelete, /*bShowConfirmation=*/false);
+			}
 		}
 
 		UPackage* Package = CreateOrLoadPackage(AssetPath);
@@ -110,19 +128,74 @@ namespace MapboxAssetGenerator
 			return Expr;
 		};
 
-		// Minimal, reliable graph: BaseColor = SatelliteTexture parameter; Roughness = 0.85.
-		// Layer-aware blending is left to the user; we ship a working baseline so the landscape
-		// renders the satellite imagery the moment it's spawned.
+		// Build world-space UVs so the satellite texture maps exactly ONCE across the chunk
+		// regardless of landscape resolution. UV = (WorldPos.xy - LandscapeOrigin.xy) / LandscapeWorldSize
+		// MICs created per-chunk set both parameters.
+		UMaterialExpressionWorldPosition* WorldPos = Cast<UMaterialExpressionWorldPosition>(
+			AddExpr(UMaterialExpressionWorldPosition::StaticClass()));
+		WorldPos->MaterialExpressionEditorX = -1100;
+		WorldPos->MaterialExpressionEditorY = -100;
+
+		UMaterialExpressionComponentMask* WorldPosXY = Cast<UMaterialExpressionComponentMask>(
+			AddExpr(UMaterialExpressionComponentMask::StaticClass()));
+		WorldPosXY->R = 1; WorldPosXY->G = 1; WorldPosXY->B = 0; WorldPosXY->A = 0;
+		WorldPosXY->Input.Expression = WorldPos;
+		WorldPosXY->MaterialExpressionEditorX = -900;
+		WorldPosXY->MaterialExpressionEditorY = -100;
+
+		UMaterialExpressionVectorParameter* OriginParam = Cast<UMaterialExpressionVectorParameter>(
+			AddExpr(UMaterialExpressionVectorParameter::StaticClass()));
+		OriginParam->ParameterName = TEXT("LandscapeOrigin");
+		OriginParam->DefaultValue = FLinearColor(0, 0, 0, 0);
+		OriginParam->MaterialExpressionEditorX = -1100;
+		OriginParam->MaterialExpressionEditorY = 80;
+
+		UMaterialExpressionComponentMask* OriginXY = Cast<UMaterialExpressionComponentMask>(
+			AddExpr(UMaterialExpressionComponentMask::StaticClass()));
+		OriginXY->R = 1; OriginXY->G = 1; OriginXY->B = 0; OriginXY->A = 0;
+		OriginXY->Input.Expression = OriginParam;
+		OriginXY->MaterialExpressionEditorX = -900;
+		OriginXY->MaterialExpressionEditorY = 80;
+
+		UMaterialExpressionSubtract* Localized = Cast<UMaterialExpressionSubtract>(
+			AddExpr(UMaterialExpressionSubtract::StaticClass()));
+		Localized->A.Expression = WorldPosXY;
+		Localized->B.Expression = OriginXY;
+		Localized->MaterialExpressionEditorX = -700;
+		Localized->MaterialExpressionEditorY = -10;
+
+		UMaterialExpressionScalarParameter* SizeParam = Cast<UMaterialExpressionScalarParameter>(
+			AddExpr(UMaterialExpressionScalarParameter::StaticClass()));
+		SizeParam->ParameterName = TEXT("LandscapeWorldSize");
+		SizeParam->DefaultValue = 100000.f; // 1km fallback so editor preview shows something
+		SizeParam->MaterialExpressionEditorX = -700;
+		SizeParam->MaterialExpressionEditorY = 160;
+
+		UMaterialExpressionDivide* UVs = Cast<UMaterialExpressionDivide>(
+			AddExpr(UMaterialExpressionDivide::StaticClass()));
+		UVs->A.Expression = Localized;
+		UVs->B.Expression = SizeParam;
+		UVs->MaterialExpressionEditorX = -500;
+		UVs->MaterialExpressionEditorY = 0;
+
+		// Satellite texture sample, fed by the computed UVs (NOT default per-vertex UVs).
 		UMaterialExpressionTextureSampleParameter2D* SatTex = Cast<UMaterialExpressionTextureSampleParameter2D>(
 			AddExpr(UMaterialExpressionTextureSampleParameter2D::StaticClass()));
 		SatTex->ParameterName = TEXT("SatelliteTexture");
-		SatTex->MaterialExpressionEditorX = -400;
+		// TextureSampleParameter2D requires a default texture for the material to compile.
+		if (UTexture2D* DefaultTex = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineResources/DefaultTexture.DefaultTexture")))
+		{
+			SatTex->Texture = DefaultTex;
+		}
+		SatTex->SamplerType = SAMPLERTYPE_Color;
+		SatTex->Coordinates.Expression = UVs;
+		SatTex->MaterialExpressionEditorX = -250;
 		SatTex->MaterialExpressionEditorY = 0;
 
 		UMaterialExpressionConstant* Roughness = Cast<UMaterialExpressionConstant>(
 			AddExpr(UMaterialExpressionConstant::StaticClass()));
 		Roughness->R = 0.85f;
-		Roughness->MaterialExpressionEditorX = -400;
+		Roughness->MaterialExpressionEditorX = -250;
 		Roughness->MaterialExpressionEditorY = 240;
 
 #if WITH_EDITORONLY_DATA
@@ -136,7 +209,7 @@ namespace MapboxAssetGenerator
 		Material->ForceRecompileForRendering();
 
 		SavePackageToDisk(Package, Material);
-		UE_LOG(LogMapboxAssets, Log, TEXT("Mapbox: created master material %s"), *AssetPath);
+		UE_LOG(LogMapboxAssets, Log, TEXT("Mapbox: created master material %s (version %d)"), *AssetPath, MasterMaterialVersion);
 		return Material;
 	}
 
@@ -177,6 +250,11 @@ namespace MapboxAssetGenerator
 		UMaterialExpressionTextureSampleParameter2D* Tex = Cast<UMaterialExpressionTextureSampleParameter2D>(
 			AddExpr(UMaterialExpressionTextureSampleParameter2D::StaticClass()));
 		Tex->ParameterName = TEXT("SatelliteTexture");
+		if (UTexture2D* DefaultTex = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineResources/DefaultTexture.DefaultTexture")))
+		{
+			Tex->Texture = DefaultTex;
+		}
+		Tex->SamplerType = SAMPLERTYPE_Color;
 
 		UMaterialExpressionScalarParameter* Opacity = Cast<UMaterialExpressionScalarParameter>(
 			AddExpr(UMaterialExpressionScalarParameter::StaticClass()));
@@ -226,7 +304,7 @@ namespace MapboxAssetGenerator
 	FString GetMasterMaterialAssetPath() { return FString(); }
 	FString GetDecalMaterialAssetPath() { return FString(); }
 	FString GetScatterGraphAssetPath() { return FString(); }
-	UMaterialInterface* GetOrCreateDefaultMasterMaterial(const TArray<FName>&) { return nullptr; }
+	UMaterialInterface* GetOrCreateDefaultMasterMaterial(const TArray<FName>&, bool) { return nullptr; }
 	UMaterialInterface* GetOrCreateDefaultDecalMaterial() { return nullptr; }
 	UPCGGraphInterface* GetOrCreateDefaultScatterGraph() { return nullptr; }
 }
