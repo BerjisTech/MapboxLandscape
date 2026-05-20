@@ -1,7 +1,7 @@
 #include "MapboxImporterPanel.h"
 
 #include "MapboxImporterEditorSubsystem.h"
-#include "MapboxLandscapeActor.h"
+#include "MapboxImporterConfig.h"
 
 #include "IDetailsView.h"
 #include "PropertyEditorModule.h"
@@ -73,10 +73,9 @@ void SMapboxImporterPanel::RefreshTarget()
 	if (!DetailsView.IsValid()) return;
 	if (UMapboxImporterEditorSubsystem* Sub = UMapboxImporterEditorSubsystem::Get())
 	{
-		AMapboxLandscapeActor* Actor = Sub->GetOrCreateImporterActor();
-		if (Actor)
+		if (UMapboxImporterConfig* Cfg = Sub->GetConfig())
 		{
-			DetailsView->SetObject(Actor, /*bForceRefresh=*/true);
+			DetailsView->SetObject(Cfg, /*bForceRefresh=*/true);
 			return;
 		}
 	}

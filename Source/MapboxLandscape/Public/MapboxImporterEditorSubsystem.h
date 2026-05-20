@@ -4,14 +4,12 @@
 #include "EditorSubsystem.h"
 #include "MapboxImporterEditorSubsystem.generated.h"
 
-class AMapboxLandscapeActor;
-class UWorld;
+class UMapboxImporterConfig;
 
 /**
- * Editor-only subsystem that owns the hidden MapboxLandscapeActor instance used by the
- * "Tools > Mapbox Landscape > Open Importer" panel. Centralises the lookup so we don't
- * spawn a new actor per panel-open, and provides a single point MissionPath plugins can
- * query to find the active import context.
+ * Editor-only subsystem that owns the singleton UMapboxImporterConfig instance.
+ * The Tools > Mapbox Landscape > Open Landscape Importer panel binds to that config;
+ * MissionPath plugins query this subsystem to resolve the active import bbox.
  */
 UCLASS()
 class MAPBOXLANDSCAPE_API UMapboxImporterEditorSubsystem : public UEditorSubsystem
@@ -22,8 +20,12 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
-	/** Returns the hidden importer actor for the current editor world. Creates one if needed. */
-	AMapboxLandscapeActor* GetOrCreateImporterActor();
+	/** The live importer config. Created on first access; never null after Initialize. */
+	UMapboxImporterConfig* GetConfig();
 
 	static UMapboxImporterEditorSubsystem* Get();
+
+private:
+	UPROPERTY(Transient)
+	TObjectPtr<UMapboxImporterConfig> Config;
 };

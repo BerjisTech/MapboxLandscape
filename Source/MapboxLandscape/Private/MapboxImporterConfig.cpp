@@ -1,4 +1,4 @@
-#include "MapboxLandscapeActor.h"
+#include "MapboxImporterConfig.h"
 
 #include "MapboxAssetGenerator.h"
 #include "MapboxLandscapeSettings.h"
@@ -81,15 +81,9 @@ namespace MapboxUI
 	}
 }
 
-AMapboxLandscapeActor::AMapboxLandscapeActor()
+UMapboxImporterConfig::UMapboxImporterConfig()
 {
-	PrimaryActorTick.bCanEverTick = false;
-	// This is an editor authoring tool, not gameplay state — strip from packaged builds and hide from Outliner.
-	bIsEditorOnlyActor = true;
-	bListedInSceneOutliner = false;
-
-	// Seed defaults from project settings. UE's serialization runs after the constructor, so saved values
-	// on loaded actors will overwrite these — this only affects newly placed actors.
+	// Pure editor authoring object. Seed defaults from project settings; the subsystem owns the live instance.
 	const UMapboxLandscapeSettings* Settings = GetDefault<UMapboxLandscapeSettings>();
 	if (Settings)
 	{
@@ -118,14 +112,26 @@ AMapboxLandscapeActor::AMapboxLandscapeActor()
 	}
 }
 
+UWorld* UMapboxImporterConfig::GetWorld() const
+{
+	if (GIsEditor && GEditor)
+	{
+		if (UWorld* W = GEditor->GetEditorWorldContext().World())
+		{
+			return W;
+		}
+	}
+	return nullptr;
+}
+
 #if WITH_EDITOR
-bool AMapboxLandscapeActor::CanEditChange(const FProperty* InProperty) const
+bool UMapboxImporterConfig::CanEditChange(const FProperty* InProperty) const
 {
 	return !bIsFetching && Super::CanEditChange(InProperty);
 }
 #endif
 
-void AMapboxLandscapeActor::EnsureDefaultLayers()
+void UMapboxImporterConfig::EnsureDefaultLayers()
 {
 	if (!MapboxLayers.IsEmpty()) return;
 
@@ -171,13 +177,13 @@ void AMapboxLandscapeActor::EnsureDefaultLayers()
 	MapboxLayers = { Forest, Grass, Urban, Road, Water };
 }
 
-void AMapboxLandscapeActor::ResetLayersToDefaults()
+void UMapboxImporterConfig::ResetLayersToDefaults()
 {
 	MapboxLayers.Empty();
 	EnsureDefaultLayers();
 }
 
-void AMapboxLandscapeActor::ClearGeneratedLandscapes()
+void UMapboxImporterConfig::ClearGeneratedLandscapes()
 {
 	for (const FMapboxTileResult& Tile : GeneratedLandscapes)
 	{
@@ -189,7 +195,7 @@ void AMapboxLandscapeActor::ClearGeneratedLandscapes()
 	GeneratedLandscapes.Reset();
 }
 
-void AMapboxLandscapeActor::RegenerateDefaultAssets()
+void UMapboxImporterConfig::RegenerateDefaultAssets()
 {
 #if WITH_EDITOR
 	TArray<FName> Names;
@@ -200,13 +206,13 @@ void AMapboxLandscapeActor::RegenerateDefaultAssets()
 #endif
 }
 
-FString AMapboxLandscapeActor::GetApiKey()
+FString UMapboxImporterConfig::GetApiKey()
 {
 	const UMapboxLandscapeSettings* Settings = GetDefault<UMapboxLandscapeSettings>();
 	return Settings ? Settings->ApiKey : FString();
 }
 
-void AMapboxLandscapeActor::ResetFromProjectSettings()
+void UMapboxImporterConfig::ResetFromProjectSettings()
 {
 	const UMapboxLandscapeSettings* Settings = GetDefault<UMapboxLandscapeSettings>();
 	if (!Settings)
@@ -272,7 +278,7 @@ static double MetersPerTileSide(double Lat, int32 Z)
 
 // ----- Bounding box resolution ------------------------------------------------
 
-void AMapboxLandscapeActor::ResolveBoundingBox(double& OutNorth, double& OutSouth, double& OutEast, double& OutWest) const
+void UMapboxImporterConfig::ResolveBoundingBox(double& OutNorth, double& OutSouth, double& OutEast, double& OutWest) const
 {
 	OutNorth = North; OutSouth = South; OutEast = East; OutWest = West;
 
@@ -315,7 +321,7 @@ void AMapboxLandscapeActor::ResolveBoundingBox(double& OutNorth, double& OutSout
 	}
 }
 
-int32 AMapboxLandscapeActor::PickAutoZoom(double DegreesPerSide) const
+int32 UMapboxImporterConfig::PickAutoZoom(double DegreesPerSide) const
 {
 	// Target around TilesPerLandscapeSide * MaxLandscapesTotal^0.5 tiles per side.
 	const double TargetTiles = FMath::Sqrt((double)MaxLandscapesTotal) * (double)TilesPerLandscapeSide;
@@ -327,7 +333,7 @@ int32 AMapboxLandscapeActor::PickAutoZoom(double DegreesPerSide) const
 
 // ----- Tile enumeration & download ------------------------------------------
 
-void AMapboxLandscapeActor::EnumerateTiles(double N, double S, double E, double W, int32 Zoom)
+void UMapboxImporterConfig::EnumerateTiles(double N, double S, double E, double W, int32 Zoom)
 {
 	MinTileX = LonToTileX(W, Zoom);
 	MaxTileX = LonToTileX(E, Zoom);
@@ -373,7 +379,7 @@ void AMapboxLandscapeActor::EnumerateTiles(double N, double S, double E, double 
 	}
 }
 
-void AMapboxLandscapeActor::FetchLandscape()
+void UMapboxImporterConfig::FetchLandscape()
 {
 	if (bIsFetching)
 	{
@@ -445,7 +451,7 @@ void AMapboxLandscapeActor::FetchLandscape()
 	StartNextDownloads();
 }
 
-void AMapboxLandscapeActor::StartNextDownloads()
+void UMapboxImporterConfig::StartNextDownloads()
 {
 	while (InFlightRequests < MaxConcurrentRequests && PendingDownloadQueue.Num() > 0)
 	{
@@ -465,7 +471,7 @@ void AMapboxLandscapeActor::StartNextDownloads()
 	}
 }
 
-void AMapboxLandscapeActor::StartRequest(const FTileCoord& Coord, ETileKind Kind)
+void UMapboxImporterConfig::StartRequest(const FTileCoord& Coord, ETileKind Kind)
 {
 	FString Url;
 	switch (Kind)
@@ -485,22 +491,22 @@ void AMapboxLandscapeActor::StartRequest(const FTileCoord& Coord, ETileKind Kind
 	}
 
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
-	Request->OnProcessRequestComplete().BindUObject(this, &AMapboxLandscapeActor::OnTileResponse, Coord, Kind);
+	Request->OnProcessRequestComplete().BindUObject(this, &UMapboxImporterConfig::OnTileResponse, Coord, Kind);
 	Request->SetURL(Url);
 	Request->SetVerb(TEXT("GET"));
 	Request->ProcessRequest();
 	++InFlightRequests;
 }
 
-static FString KeyFor(int32 X, int32 Y, AMapboxLandscapeActor::ETileKind Kind)
+static FString KeyFor(int32 X, int32 Y, UMapboxImporterConfig::ETileKind Kind)
 {
 	const TCHAR* K = TEXT("h");
-	if (Kind == AMapboxLandscapeActor::ETileKind::Metadata) K = TEXT("m");
-	else if (Kind == AMapboxLandscapeActor::ETileKind::Satellite) K = TEXT("s");
+	if (Kind == UMapboxImporterConfig::ETileKind::Metadata) K = TEXT("m");
+	else if (Kind == UMapboxImporterConfig::ETileKind::Satellite) K = TEXT("s");
 	return FString::Printf(TEXT("%s_%d_%d"), K, X, Y);
 }
 
-void AMapboxLandscapeActor::OnTileResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess, FTileCoord Coord, ETileKind Kind)
+void UMapboxImporterConfig::OnTileResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess, FTileCoord Coord, ETileKind Kind)
 {
 	--InFlightRequests;
 	FTileBlob Blob;
@@ -540,7 +546,7 @@ static bool DecodeTileToRGBA(const TArray<uint8>& Bytes, TArray<uint8>& OutRGBA,
 	return Wrapper->GetRaw(ERGBFormat::RGBA, 8, OutRGBA);
 }
 
-uint16 AMapboxLandscapeActor::DecodeHeight(uint8 R, uint8 G, uint8 B) const
+uint16 UMapboxImporterConfig::DecodeHeight(uint8 R, uint8 G, uint8 B) const
 {
 	// Mapbox Terrain-RGB: meters = -10000 + (R*256*256 + G*256 + B) * 0.1
 	// We do not encode here; this entry point is unused in the new pipeline (we decode floats first).
@@ -573,7 +579,7 @@ static void RGBToHSV(const FLinearColor& In, float& OutH, float& OutS, float& Ou
 	OutH = H;
 }
 
-int32 AMapboxLandscapeActor::ClassifyPixel(const FColor& Pixel) const
+int32 UMapboxImporterConfig::ClassifyPixel(const FColor& Pixel) const
 {
 	const FLinearColor Src(Pixel);
 	float SrcH, SrcS, SrcV;
@@ -617,7 +623,7 @@ int32 AMapboxLandscapeActor::ClassifyPixel(const FColor& Pixel) const
 
 // ----- Texture asset save ----------------------------------------------------
 
-UTexture2D* AMapboxLandscapeActor::SaveTransientToAsset(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& AssetName) const
+UTexture2D* UMapboxImporterConfig::SaveTransientToAsset(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& AssetName) const
 {
 #if WITH_EDITOR
 	if (Pixels.Num() != W * H) return nullptr;
@@ -650,7 +656,7 @@ UTexture2D* AMapboxLandscapeActor::SaveTransientToAsset(const TArray<FColor>& Pi
 #endif
 }
 
-UMaterialInterface* AMapboxLandscapeActor::GetOrGenerateMasterMaterial()
+UMaterialInterface* UMapboxImporterConfig::GetOrGenerateMasterMaterial()
 {
 	if (UMaterialInterface* Set = LandscapeMasterMaterial.LoadSynchronous())
 	{
@@ -669,7 +675,7 @@ UMaterialInterface* AMapboxLandscapeActor::GetOrGenerateMasterMaterial()
 #endif
 }
 
-UPCGGraphInterface* AMapboxLandscapeActor::GetOrGenerateScatterGraph()
+UPCGGraphInterface* UMapboxImporterConfig::GetOrGenerateScatterGraph()
 {
 	if (UPCGGraphInterface* Set = ScatterPCGGraph.LoadSynchronous())
 	{
@@ -740,7 +746,7 @@ static int32 PickValidLandscapeSize(int32 Desired, int32 SectionSize = 63)
 	return Components * SectionSize + 1;
 }
 
-void AMapboxLandscapeActor::OnAllTilesDownloaded()
+void UMapboxImporterConfig::OnAllTilesDownloaded()
 {
 	// Compute global min elevation across all height tiles for a shared baseline.
 	float GlobalMin = FLT_MAX;
@@ -942,7 +948,7 @@ void AMapboxLandscapeActor::OnAllTilesDownloaded()
 	FinishFetch();
 }
 
-ALandscape* AMapboxLandscapeActor::SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
+ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
 	const TArray<uint16>& HeightData,
 	const TMap<FName, TArray<uint8>>& LayerWeights,
 	UTexture2D* SatelliteTexture,
@@ -974,7 +980,7 @@ ALandscape* AMapboxLandscapeActor::SpawnLandscapeForChunk(const FLandscapeChunk&
 	const double XYScale = WorldSizePerLandscapeCm / (LandscapeVertsPerSide - 1);
 	const double LocalX = (Chunk.MinTileX - MinTileX) * TileWorldCm - TotalWorldX * 0.5;
 	const double LocalY = (Chunk.MinTileY - MinTileY) * TileWorldCm - TotalWorldY * 0.5;
-	const FVector ChunkOrigin = GetActorLocation() + FVector(LocalX, LocalY, 0.0);
+	const FVector ChunkOrigin = ImportOrigin + FVector(LocalX, LocalY, 0.0);
 	Landscape->SetActorTransform(FTransform(FRotator::ZeroRotator, ChunkOrigin,
 		FVector(XYScale, XYScale, LandscapeZScale)));
 
@@ -1096,7 +1102,7 @@ static FVector SampleLandscapeHeight(ALandscape* Landscape, double WorldX, doubl
 	return FVector(WorldX, WorldY, Origin.Z);
 }
 
-void AMapboxLandscapeActor::SpawnPCGForLandscape(ALandscape* Landscape, UTexture2D* /*SatelliteTexture*/,
+void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscape* Landscape, UTexture2D* /*SatelliteTexture*/,
 	const TMap<FName, TArray<uint8>>& LayerWeights, int32 LandscapeVerts, double WorldSizePerLandscapeCm)
 {
 	if (!Landscape) return;
@@ -1179,7 +1185,7 @@ void AMapboxLandscapeActor::SpawnPCGForLandscape(ALandscape* Landscape, UTexture
 	}
 }
 
-void AMapboxLandscapeActor::SpawnSatelliteDecal(ALandscape* Landscape, UTexture2D* SatelliteTexture, double WorldSizePerLandscapeCm)
+void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscape* Landscape, UTexture2D* SatelliteTexture, double WorldSizePerLandscapeCm)
 {
 	if (SatelliteMode != EMapboxSatelliteMode::OverlayDecal) return;
 	if (!Landscape || !SatelliteTexture) return;
@@ -1225,7 +1231,7 @@ void AMapboxLandscapeActor::SpawnSatelliteDecal(ALandscape* Landscape, UTexture2
 #endif
 }
 
-void AMapboxLandscapeActor::FinishFetch()
+void UMapboxImporterConfig::FinishFetch()
 {
 	bIsFetching = false;
 	InFlightRequests = 0;

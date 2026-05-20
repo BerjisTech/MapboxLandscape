@@ -1,15 +1,16 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GameFramework/Actor.h"
+#include "UObject/Object.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Materials/MaterialInterface.h"
 #include "MapboxLayerDef.h"
-#include "MapboxLandscapeActor.generated.h"
+#include "MapboxImporterConfig.generated.h"
 
 class UPCGGraphInterface;
 class ALandscape;
 class UTexture2D;
+class UWorld;
 
 UENUM(BlueprintType)
 enum class ECoordinateMode : uint8
@@ -34,13 +35,24 @@ struct FMapboxTileResult
 	TObjectPtr<ALandscape> Landscape = nullptr;
 };
 
-UCLASS()
-class MAPBOXLANDSCAPE_API AMapboxLandscapeActor : public AActor
+/**
+ * Editor-only configuration object for the Mapbox Landscape Importer.
+ * Lives in UMapboxImporterEditorSubsystem; the SMapboxImporterPanel binds an IDetailsView to it.
+ * Not an actor — strictly an authoring tool that exists only at edit-time.
+ */
+UCLASS(BlueprintType, NotBlueprintable)
+class MAPBOXLANDSCAPE_API UMapboxImporterConfig : public UObject
 {
 	GENERATED_BODY()
 
 public:
-	AMapboxLandscapeActor();
+	UMapboxImporterConfig();
+
+	/** Returns the editor world; the fetch spawns ALandscape actors into it. */
+	virtual UWorld* GetWorld() const override;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Placement", meta = (ToolTip = "World-space origin used to anchor spawned landscape tiles. Move it to relocate the import area; you can also move the spawned ALandscape actors directly afterward."))
+	FVector ImportOrigin = FVector::ZeroVector;
 
 	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates")
 	ECoordinateMode CoordinateMode = ECoordinateMode::CenterRadius;
@@ -129,7 +141,7 @@ public:
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Force regeneration of the default M_MapboxLandscape material and PCG scatter graph in the plugin's Content folder."))
 	void RegenerateDefaultAssets();
 
-	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Copy the current project settings (zoom, layers, material, etc.) into this actor, overwriting any per-actor overrides."))
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Copy the current project settings (zoom, layers, material, etc.) into this importer."))
 	void ResetFromProjectSettings();
 
 	static FString GetApiKey();
