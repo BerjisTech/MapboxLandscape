@@ -1,0 +1,33 @@
+# Unreal Engine build artifacts (regenerated on every compile, per-user, huge)
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# Rider / JetBrains
+.idea/
+
+# VS Code
+.vscode/
+
+# macOS / Linux junk
+.DS_Store
+Thumbs.db
+
+# Crash dumps
+*.dmp
+
+# Per-user editor presets
+*.uprojectdirs
