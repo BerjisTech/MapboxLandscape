@@ -3,10 +3,11 @@
     "Data": {
         "Source": "f:\\airmuseum\\plugins\\mapboxlandscape\\source\\mapboxlandscape\\private\\mapboxlandscape.cpp",
         "ProvidedModule": "",
-        "PCH": "f:\\airmuseum\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.valexpapi.cpp20.h.pch",
+        "PCH": "f:\\airmuseum\\intermediate\\build\\win64\\x64\\airmuseumeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.valexpapi.cpp20.h.pch",
         "Includes": [
             "f:\\airmuseum\\plugins\\mapboxlandscape\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\mapboxlandscape\\definitions.mapboxlandscape.h",
-            "f:\\airmuseum\\plugins\\mapboxlandscape\\source\\mapboxlandscape\\public\\mapboxlandscape.h"
+            "f:\\airmuseum\\plugins\\mapboxlandscape\\source\\mapboxlandscape\\public\\mapboxlandscape.h",
+            "f:\\airmuseum\\plugins\\mapboxlandscape\\source\\mapboxlandscape\\private\\mapboximporterpanel.h"
         ],
         "ImportedModules": [],
         "ImportedHeaderUnits": []

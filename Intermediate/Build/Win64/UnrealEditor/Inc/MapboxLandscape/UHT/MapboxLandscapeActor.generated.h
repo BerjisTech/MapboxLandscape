@@ -16,15 +16,29 @@
 
 PRAGMA_DISABLE_DEPRECATION_WARNINGS
 
+// ********** Begin ScriptStruct FMapboxTileResult *************************************************
+struct Z_Construct_UScriptStruct_FMapboxTileResult_Statics;
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_25_GENERATED_BODY \
+	friend struct ::Z_Construct_UScriptStruct_FMapboxTileResult_Statics; \
+	MAPBOXLANDSCAPE_API static class UScriptStruct* StaticStruct();
+
+
+struct FMapboxTileResult;
+// ********** End ScriptStruct FMapboxTileResult ***************************************************
+
 // ********** Begin Class AMapboxLandscapeActor ****************************************************
-#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_RPC_WRAPPERS_NO_PURE_DECLS \
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_RPC_WRAPPERS_NO_PURE_DECLS \
+	DECLARE_FUNCTION(execResetFromProjectSettings); \
+	DECLARE_FUNCTION(execRegenerateDefaultAssets); \
+	DECLARE_FUNCTION(execResetLayersToDefaults); \
+	DECLARE_FUNCTION(execClearGeneratedLandscapes); \
 	DECLARE_FUNCTION(execFetchLandscape);
 
 
 struct Z_Construct_UClass_AMapboxLandscapeActor_Statics;
 MAPBOXLANDSCAPE_API UClass* Z_Construct_UClass_AMapboxLandscapeActor_NoRegister();
 
-#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_INCLASS_NO_PURE_DECLS \
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_INCLASS_NO_PURE_DECLS \
 private: \
 	static void StaticRegisterNativesAMapboxLandscapeActor(); \
 	friend struct ::Z_Construct_UClass_AMapboxLandscapeActor_Statics; \
@@ -35,7 +49,7 @@ public: \
 	DECLARE_SERIALIZER(AMapboxLandscapeActor)
 
 
-#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_ENHANCED_CONSTRUCTORS \
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_ENHANCED_CONSTRUCTORS \
 	/** Deleted move- and copy-constructors, should never be used */ \
 	AMapboxLandscapeActor(AMapboxLandscapeActor&&) = delete; \
 	AMapboxLandscapeActor(const AMapboxLandscapeActor&) = delete; \
@@ -45,13 +59,13 @@ public: \
 	NO_API virtual ~AMapboxLandscapeActor();
 
 
-#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_16_PROLOG
-#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_GENERATED_BODY \
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_37_PROLOG
+#define FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_GENERATED_BODY \
 PRAGMA_DISABLE_DEPRECATION_WARNINGS \
 public: \
-	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_RPC_WRAPPERS_NO_PURE_DECLS \
-	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_INCLASS_NO_PURE_DECLS \
-	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_19_ENHANCED_CONSTRUCTORS \
+	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_RPC_WRAPPERS_NO_PURE_DECLS \
+	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_INCLASS_NO_PURE_DECLS \
+	FID_Airmuseum_Plugins_MapboxLandscape_Source_MapboxLandscape_Public_MapboxLandscapeActor_h_40_ENHANCED_CONSTRUCTORS \
 private: \
 PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
@@ -65,8 +79,8 @@ class AMapboxLandscapeActor;
 
 // ********** Begin Enum ECoordinateMode ***********************************************************
 #define FOREACH_ENUM_ECOORDINATEMODE(op) \
-	op(ECoordinateMode::BoundingBox) \
 	op(ECoordinateMode::CenterRadius) \
+	op(ECoordinateMode::BoundingBox) \
 	op(ECoordinateMode::ToolString) 
 
 enum class ECoordinateMode : uint8;

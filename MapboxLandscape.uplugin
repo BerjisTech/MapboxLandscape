@@ -1,11 +1,11 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0",
+	"Version": 2,
+	"VersionName": "2.0",
 	"FriendlyName": "Mapbox Landscape",
-	"Description": "Fetches Mapbox tiles and creates UE landscapes with metadata classification.",
+	"Description": "Fetches Mapbox terrain, satellite and metadata tiles and creates real-world UE landscapes with user-defined layer rules and PCG scatter.",
 	"Category": "Landscape",
-	"CreatedBy": "Gemini CLI",
+	"CreatedBy": "Airmuseum",
 	"CreatedByURL": "",
 	"DocsURL": "",
 	"MarketplaceURL": "",
@@ -24,6 +24,10 @@
 	"Plugins": [
 		{
 			"Name": "LandscapePatch",
+			"Enabled": true
+		},
+		{
+			"Name": "PCG",
 			"Enabled": true
 		}
 	]

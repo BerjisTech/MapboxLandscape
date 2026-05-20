@@ -5,55 +5,40 @@ public class MapboxLandscape : ModuleRules
 	public MapboxLandscape(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		
-		PublicIncludePaths.AddRange(
-			new string[] {
-				// ... add public include paths required here ...
-			}
-			);
-				
-		
-		PrivateIncludePaths.AddRange(
-			new string[] {
-				// ... add other private include paths required here ...
-			}
-			);
-			
-		
-		PublicDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"Core",
-				// ... add other public dependencies that you statically link with here ...
-			}
-			);
-			
-		
-		PrivateDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"CoreUObject",
-				"Engine",
-				"Slate",
-				"SlateCore",
-				"HTTP",
-				"ImageWrapper",
-				"Json",
-				"JsonUtilities",
-				"Landscape",
-				"LandscapeEditor",
-				"EditorFramework",
-				"UnrealEd"
-				// ... add private dependencies that you statically link with here ...	
-			}
-			);
-		
-		
-		DynamicallyLoadedModuleNames.AddRange(
-			new string[]
-			{
-				// ... add any modules that your module loads dynamically here ...
-			}
-			);
+
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"Core",
+			"CoreUObject",
+			"Engine",
+		});
+
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
+			"DeveloperSettings",
+			"EditorSubsystem",
+			"Slate",
+			"SlateCore",
+			"ToolMenus",
+			"LevelEditor",
+			"WorkspaceMenuStructure",
+			"PropertyEditor",
+			"HTTP",
+			"ImageWrapper",
+			"Json",
+			"JsonUtilities",
+			"Landscape",
+			"LandscapeEditor",
+			"EditorFramework",
+			"UnrealEd",
+			"AssetTools",
+			"AssetRegistry",
+			"Foliage",
+			"PhysicsCore",
+			"Projects",
+			"RenderCore",
+			"RHI",
+			"PCG",
+		});
 	}
 }

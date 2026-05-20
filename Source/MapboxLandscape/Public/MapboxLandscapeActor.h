@@ -3,110 +3,212 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Interfaces/IHttpRequest.h"
+#include "Materials/MaterialInterface.h"
+#include "MapboxLayerDef.h"
 #include "MapboxLandscapeActor.generated.h"
+
+class UPCGGraphInterface;
+class ALandscape;
+class UTexture2D;
 
 UENUM(BlueprintType)
 enum class ECoordinateMode : uint8
 {
-	BoundingBox UMETA(DisplayName = "Bounding Box (N/S/E/W)"),
 	CenterRadius UMETA(DisplayName = "Center Point & Radius"),
-	ToolString UMETA(DisplayName = "Tool String (maps.ludicdrive.com)")
+	BoundingBox  UMETA(DisplayName = "Bounding Box (N/S/E/W)"),
+	ToolString   UMETA(DisplayName = "Tool String (comma-separated lat/lng)")
+};
+
+USTRUCT(BlueprintType)
+struct FMapboxTileResult
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, Category = "Tile")
+	int32 TileGridX = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "Tile")
+	int32 TileGridY = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "Tile")
+	TObjectPtr<ALandscape> Landscape = nullptr;
 };
 
 UCLASS()
 class MAPBOXLANDSCAPE_API AMapboxLandscapeActor : public AActor
 {
 	GENERATED_BODY()
-	
-public:	
+
+public:
 	AMapboxLandscapeActor();
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings")
-	FString ApiKey;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates")
+	ECoordinateMode CoordinateMode = ECoordinateMode::CenterRadius;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates")
-	ECoordinateMode CoordinateMode = ECoordinateMode::BoundingBox;
-
-	// Bounding Box Mode
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox"))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox", EditConditionHides))
 	double North = 36.17;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox"))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox", EditConditionHides))
 	double South = 36.15;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox"))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox", EditConditionHides))
 	double East = -86.77;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox"))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::BoundingBox", EditConditionHides))
 	double West = -86.79;
 
-	// Center & Radius Mode
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius"))
-	double CenterLatitude = 36.16;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius", EditConditionHides))
+	double CenterLatitude = -1.2921;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius"))
-	double CenterLongitude = -86.78;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius", EditConditionHides))
+	double CenterLongitude = 36.8219;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius"))
-	double RadiusKm = 1.0;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::CenterRadius", EditConditionHides, ClampMin = "0.1", ClampMax = "200.0"))
+	double RadiusKm = 5.0;
 
-	// Tool String Mode
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings | Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::ToolString"))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Coordinates", meta = (EditCondition = "CoordinateMode == ECoordinateMode::ToolString", EditConditionHides))
 	FString CoordinateString;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings")
-	int32 ZoomLevel = 15;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling")
+	bool bAutoZoom = true;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings")
-	bool bImportSatellite = true;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (EditCondition = "!bAutoZoom", ClampMin = "8", ClampMax = "18"))
+	int32 ZoomLevel = 14;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings")
-	UMaterialInterface* BaseMaterial;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (ClampMin = "1", ClampMax = "16", ToolTip = "Web-mercator tiles grouped together into one ALandscape. 4 -> 1024px landscapes. Lower = more landscapes, higher fidelity per actor."))
+	int32 TilesPerLandscapeSide = 4;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox Settings")
-	FString MetadataStyleId = TEXT("mapbox/streets-v11");
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (ClampMin = "1", ClampMax = "256", ToolTip = "Hard cap so a typo doesn't request thousands of tiles."))
+	int32 MaxLandscapesTotal = 64;
 
-	UFUNCTION(CallInEditor, Category = "Mapbox Actions")
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling")
+	int32 MaxConcurrentRequests = 16;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (ClampMin = "1.0", ClampMax = "1000.0", ToolTip = "Cell size in cm per heightmap sample. 100 = 1m per pixel."))
+	float MetersPerPixel = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Elevation", meta = (ClampMin = "0.1", ClampMax = "10.0"))
+	float ZExaggeration = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Elevation")
+	bool bRebaseToSeaLevel = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Satellite")
+	EMapboxSatelliteMode SatelliteMode = EMapboxSatelliteMode::BlendIntoMaterial;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Style", meta = (ToolTip = "Mapbox style used to derive the layer classification. Pick a style with solid colors per land type."))
+	FString MetadataStyleId = TEXT("mapbox/satellite-streets-v12");
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Layers")
+	TArray<FMapboxLayerDef> MapboxLayers;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Material", meta = (ToolTip = "Master landscape material. Leave empty to auto-generate the default M_MapboxLandscape on Fetch."))
+	TSoftObjectPtr<UMaterialInterface> LandscapeMasterMaterial;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Material")
+	bool bAutoGenerateDefaultAssets = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|PCG", meta = (ToolTip = "PCG graph spawned on each landscape to scatter the per-layer assets. Auto-generated if empty."))
+	TSoftObjectPtr<UPCGGraphInterface> ScatterPCGGraph;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|PCG")
+	bool bSpawnPCGComponents = true;
+
+	UPROPERTY(VisibleAnywhere, Category = "Mapbox|Status")
+	TArray<FMapboxTileResult> GeneratedLandscapes;
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions")
 	void FetchLandscape();
 
-protected:
-	virtual void BeginPlay() override;
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions")
+	void ClearGeneratedLandscapes();
 
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions")
+	void ResetLayersToDefaults();
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Force regeneration of the default M_MapboxLandscape material and PCG scatter graph in the plugin's Content folder."))
+	void RegenerateDefaultAssets();
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Copy the current project settings (zoom, layers, material, etc.) into this actor, overwriting any per-actor overrides."))
+	void ResetFromProjectSettings();
+
+	static FString GetApiKey();
+
+	struct FTileCoord { int32 X = 0; int32 Y = 0; int32 Z = 0; };
+	enum class ETileKind : uint8 { Height, Metadata, Satellite };
+
+protected:
 #if WITH_EDITOR
 	virtual bool CanEditChange(const FProperty* InProperty) const override;
 #endif
 
 private:
-	void DownloadHeightTile(int32 X, int32 Y, int32 Z);
-	void OnHeightTileDownloaded(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, int32 X, int32 Y);
-
-	void DownloadMetadataTile(int32 X, int32 Y, int32 Z);
-	void OnMetadataTileDownloaded(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, int32 X, int32 Y);
-
-	void DownloadSatelliteTile(int32 X, int32 Y, int32 Z);
-	void OnSatelliteTileDownloaded(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, int32 X, int32 Y);
-
-	struct FTileData
+	struct FTileBlob
 	{
-		TArray<uint8> RawData;
-		int32 X, Y;
+		FTileCoord Coord;
+		ETileKind Kind;
+		TArray<uint8> Bytes;
+		bool bOk = false;
 	};
 
-	TArray<FTileData> DownloadedHeightTiles;
-	TArray<FTileData> DownloadedMetadataTiles;
-	TArray<FTileData> DownloadedSatelliteTiles;
-	
-	int32 PendingHeightRequests = 0;
-	int32 PendingMetadataRequests = 0;
-	int32 PendingSatelliteRequests = 0;
-	bool bIsFetching = false;
+	struct FLandscapeChunk
+	{
+		int32 ChunkX = 0;
+		int32 ChunkY = 0;
+		int32 MinTileX = 0;
+		int32 MinTileY = 0;
+		int32 TilesX = 0;
+		int32 TilesY = 0;
+	};
 
-	int32 MinTileX, MaxTileX, MinTileY, MaxTileY;
+	void ResolveBoundingBox(double& OutNorth, double& OutSouth, double& OutEast, double& OutWest) const;
+	int32 PickAutoZoom(double DegreesPerSide) const;
+	void EnumerateTiles(double N, double S, double E, double W, int32 Zoom);
+	void StartNextDownloads();
+	void StartRequest(const FTileCoord& Coord, ETileKind Kind);
+	void OnTileResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, FTileCoord Coord, ETileKind Kind);
+	void OnAllTilesDownloaded();
 
+	uint16 DecodeHeight(uint8 R, uint8 G, uint8 B) const;
+	int32 ClassifyPixel(const FColor& Pixel) const;
+
+	UTexture2D* SaveTransientToAsset(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& AssetName) const;
+	UMaterialInterface* GetOrGenerateMasterMaterial();
+	UPCGGraphInterface* GetOrGenerateScatterGraph();
+
+	ALandscape* SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
+	                                   const TArray<uint16>& HeightData,
+	                                   const TMap<FName, TArray<uint8>>& LayerWeights,
+	                                   UTexture2D* SatelliteTexture,
+	                                   double LandscapeVertsPerSide,
+	                                   double WorldSizePerLandscapeCm,
+	                                   double LandscapeZScale,
+	                                   double TileWorldCm,
+	                                   double TotalWorldX,
+	                                   double TotalWorldY);
+
+	void SpawnPCGForLandscape(ALandscape* Landscape, UTexture2D* SatelliteTexture,
+	                          const TMap<FName, TArray<uint8>>& LayerWeights,
+	                          int32 LandscapeVerts,
+	                          double WorldSizePerLandscapeCm);
+
+	void SpawnSatelliteDecal(ALandscape* Landscape, UTexture2D* SatelliteTexture,
+	                         double WorldSizePerLandscapeCm);
+
+	void EnsureDefaultLayers();
 	void FinishFetch();
-	void CheckAllTilesDownloaded();
-	void ProcessTiles();
-	uint16 DecodeHeight(uint8 R, uint8 G, uint8 B);
 
-	void CreateLandscape(const TArray<uint16>& HeightData, const TArray<FColor>& MetadataData, UTexture2D* SatelliteTexture, int32 Width, int32 Height);
+	TArray<FTileCoord> PendingDownloadQueue;
+	TMap<FString, FTileBlob> CompletedBlobs;
+	TArray<FLandscapeChunk> Chunks;
+	int32 InFlightRequests = 0;
+	int32 TotalExpectedBlobs = 0;
+	int32 ResolvedZoom = 14;
+
+	int32 MinTileX = 0;
+	int32 MaxTileX = 0;
+	int32 MinTileY = 0;
+	int32 MaxTileY = 0;
+
+	bool bIsFetching = false;
 };
