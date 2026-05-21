@@ -15,7 +15,10 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Framework/Notifications/NotificationManager.h"
+#include "HAL/PlatformMemory.h"
 #include "Misc/MessageDialog.h"
+#include "Misc/ScopedSlowTask.h"
+#include "ObjectTools.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "FileHelpers.h"
 #include "HttpModule.h"
@@ -24,9 +27,12 @@
 #include "Interfaces/IHttpResponse.h"
 #include "Landscape.h"
 #include "LandscapeComponent.h"
+#include "LandscapeConfigHelper.h"
 #include "LandscapeInfo.h"
 #include "LandscapeLayerInfoObject.h"
 #include "LandscapeProxy.h"
+#include "LandscapeStreamingProxy.h"
+#include "WorldPartition/WorldPartition.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
@@ -37,6 +43,7 @@
 #include "PCGGraph.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
+#include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogMapbox, Log, All);
 
@@ -116,6 +123,36 @@ UMapboxImporterConfig::UMapboxImporterConfig()
 	}
 }
 
+FString UMapboxImporterConfig::GetLevelSubfolder() const
+{
+	// Group per-fetch generated assets under a folder named after the current editor level,
+	// so each level's Mapbox content lives in its own /Game/MapboxLandscape/{Kind}/{LevelName}/
+	// subfolder. Falls back to "Default" if there's no world (e.g. cooking) or no persistent level.
+	if (UWorld* World = GetWorld())
+	{
+		if (ULevel* Level = World->PersistentLevel)
+		{
+			if (UPackage* Outer = Level->GetOutermost())
+			{
+				FString Short = FPackageName::GetShortName(Outer->GetName());
+				// Strip the standard "UEDPIE_" prefix if it ever shows up (play-in-editor world).
+				if (Short.StartsWith(TEXT("UEDPIE_")))
+				{
+					int32 Underscore = INDEX_NONE;
+					if (Short.FindChar(TCHAR('_'), Underscore))
+					{
+						Short = Short.Mid(Underscore + 1);
+					}
+				}
+				// Make filesystem-safe (asset paths permit a narrower set of chars than UE package names).
+				const FString Cleaned = ObjectTools::SanitizeObjectName(Short);
+				return Cleaned.IsEmpty() ? FString(TEXT("Default")) : Cleaned;
+			}
+		}
+	}
+	return TEXT("Default");
+}
+
 UWorld* UMapboxImporterConfig::GetWorld() const
 {
 	if (GIsEditor && GEditor)
@@ -139,89 +176,12 @@ void UMapboxImporterConfig::EnsureDefaultLayers()
 {
 	if (!MapboxLayers.IsEmpty()) return;
 
-	auto MakeVectorLayer = [](FName Name, const FString& MvtLayer, const TArray<FString>& Classes,
-		float LineWidth, int32 Priority, FLinearColor Tint, bool bScatter = false, float Density = 0.f) -> FMapboxLayerDef
+	// Source of truth is the project settings. The settings constructor lazily fills
+	// DefaultLayers with the full preset list (Clear/Water/Buildings/Rock/Sand/Mud/Forest/...).
+	if (const UMapboxLandscapeSettings* Settings = GetDefault<UMapboxLandscapeSettings>())
 	{
-		FMapboxLayerDef L;
-		L.LayerName = Name;
-		L.MatchMode = EMapboxLayerMatchMode::Vector;
-		L.Priority = Priority;
-		L.MaterialTint = Tint;
-		L.bScatterEnabled = bScatter;
-		L.ScatterDensity = Density;
-
-		FMapboxVectorFeatureFilter F;
-		F.MvtLayer = MvtLayer;
-		F.Classes = Classes;
-		F.LineWidthMeters = LineWidth;
-		L.VectorFilters.Add(F);
-		return L;
-	};
-
-	// Polygons (priority highest — buildings/water override everything else)
-	FMapboxLayerDef Water = MakeVectorLayer(TEXT("Water"), TEXT("water"), {}, 0.f, 90,
-		FLinearColor(0.10f, 0.25f, 0.45f));
-
-	FMapboxLayerDef Building = MakeVectorLayer(TEXT("Buildings"), TEXT("building"), {}, 0.f, 80,
-		FLinearColor(0.4f, 0.38f, 0.35f));
-
-	// Airport surfaces
-	FMapboxLayerDef Runway = MakeVectorLayer(TEXT("Runway"), TEXT("aeroway"),
-		{ TEXT("runway") }, 45.f, 75, FLinearColor(0.18f, 0.18f, 0.20f));
-
-	FMapboxLayerDef Taxiway = MakeVectorLayer(TEXT("Taxiway"), TEXT("aeroway"),
-		{ TEXT("taxiway") }, 18.f, 72, FLinearColor(0.22f, 0.22f, 0.22f));
-
-	// Road network — graded by class so highways look different from footpaths
-	FMapboxLayerDef Highway = MakeVectorLayer(TEXT("Highway"), TEXT("road"),
-		{ TEXT("motorway"), TEXT("motorway_link"), TEXT("trunk"), TEXT("trunk_link") },
-		15.f, 60, FLinearColor(0.25f, 0.25f, 0.27f));
-
-	FMapboxLayerDef Primary = MakeVectorLayer(TEXT("PrimaryRoad"), TEXT("road"),
-		{ TEXT("primary"), TEXT("primary_link"), TEXT("secondary"), TEXT("secondary_link") },
-		10.f, 55, FLinearColor(0.32f, 0.32f, 0.34f));
-
-	FMapboxLayerDef Tertiary = MakeVectorLayer(TEXT("TertiaryRoad"), TEXT("road"),
-		{ TEXT("tertiary"), TEXT("tertiary_link"), TEXT("street") },
-		7.f, 50, FLinearColor(0.38f, 0.38f, 0.40f));
-
-	FMapboxLayerDef Residential = MakeVectorLayer(TEXT("ResidentialRoad"), TEXT("road"),
-		{ TEXT("street_limited"), TEXT("service"), TEXT("track") },
-		5.f, 45, FLinearColor(0.45f, 0.45f, 0.47f));
-
-	FMapboxLayerDef Path = MakeVectorLayer(TEXT("Path"), TEXT("road"),
-		{ TEXT("path"), TEXT("footway"), TEXT("pedestrian"), TEXT("steps") },
-		2.f, 40, FLinearColor(0.55f, 0.48f, 0.35f));
-
-	FMapboxLayerDef Railway = MakeVectorLayer(TEXT("Railway"), TEXT("road"),
-		{ TEXT("major_rail"), TEXT("minor_rail"), TEXT("service_rail") },
-		4.f, 52, FLinearColor(0.20f, 0.20f, 0.22f));
-
-	// Landuse polygons — drive vegetation scatter
-	FMapboxLayerDef Forest = MakeVectorLayer(TEXT("Forest"), TEXT("landuse"),
-		{ TEXT("wood"), TEXT("forest") },
-		0.f, 30, FLinearColor(0.20f, 0.45f, 0.15f), /*bScatter=*/true, /*density=*/4.f);
-
-	FMapboxLayerDef Park = MakeVectorLayer(TEXT("Park"), TEXT("landuse"),
-		{ TEXT("park"), TEXT("pitch"), TEXT("garden") },
-		0.f, 28, FLinearColor(0.35f, 0.55f, 0.30f), /*bScatter=*/true, /*density=*/8.f);
-
-	FMapboxLayerDef Industrial = MakeVectorLayer(TEXT("Industrial"), TEXT("landuse"),
-		{ TEXT("industrial"), TEXT("commercial"), TEXT("parking") },
-		0.f, 25, FLinearColor(0.45f, 0.45f, 0.42f));
-
-	// Color fallback — catches everything else as grass
-	FMapboxLayerDef Grass;
-	Grass.LayerName = TEXT("Grass");
-	Grass.MatchMode = EMapboxLayerMatchMode::Color;
-	Grass.TargetColor = FLinearColor(0.55f, 0.70f, 0.30f);
-	Grass.MaterialTint = FLinearColor(0.45f, 0.55f, 0.25f);
-	Grass.Priority = 10;
-	Grass.bScatterEnabled = true;
-	Grass.ScatterDensity = 12.f;
-
-	MapboxLayers = { Water, Building, Runway, Taxiway, Highway, Primary, Tertiary,
-		Residential, Path, Railway, Forest, Park, Industrial, Grass };
+		MapboxLayers = Settings->DefaultLayers;
+	}
 }
 
 void UMapboxImporterConfig::ResetLayersToDefaults()
@@ -264,8 +224,9 @@ void UMapboxImporterConfig::FixExistingLandscapeMaterials()
 #if WITH_EDITOR
 	// Build the working set: in-memory GeneratedLandscapes plus any "MapboxLandscape_C*" actors
 	// in the current editor world. The level scan is what makes this work after editor restart
-	// (the importer config is transient and forgets refs between sessions).
-	TSet<TObjectPtr<ALandscape>> Working;
+	// (the importer config is transient and forgets refs between sessions). Iterating
+	// ALandscapeProxy covers both the parent ALandscape and every ALandscapeStreamingProxy.
+	TSet<TObjectPtr<ALandscapeProxy>> Working;
 	for (const FMapboxTileResult& T : GeneratedLandscapes)
 	{
 		if (IsValid(T.Landscape)) Working.Add(T.Landscape);
@@ -274,13 +235,13 @@ void UMapboxImporterConfig::FixExistingLandscapeMaterials()
 	UWorld* World = GetWorld();
 	if (World)
 	{
-		for (TActorIterator<ALandscape> It(World); It; ++It)
+		for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
 		{
-			ALandscape* L = *It;
+			ALandscapeProxy* L = *It;
 			if (!IsValid(L)) continue;
 			const FString Label = L->GetActorLabel();
 			const FString Name = L->GetName();
-			if (Label.StartsWith(TEXT("MapboxLandscape_")) || Name.StartsWith(TEXT("MapboxLandscape_")))
+			if (Label.StartsWith(TEXT("MapboxLandscape")) || Name.StartsWith(TEXT("MapboxLandscape")))
 			{
 				Working.Add(L);
 			}
@@ -310,7 +271,7 @@ void UMapboxImporterConfig::FixExistingLandscapeMaterials()
 	// 2. Recompute each landscape's origin/size from its actor transform, rebuild its MIC, reassign.
 	int32 Fixed = 0;
 	int32 ChunkIdx = 0;
-	for (ALandscape* Landscape : Working)
+	for (ALandscapeProxy* Landscape : Working)
 	{
 		if (!IsValid(Landscape)) continue;
 
@@ -346,15 +307,24 @@ void UMapboxImporterConfig::FixExistingLandscapeMaterials()
 
 		// Re-resolve the chunk's satellite texture. Looking it up through the current MIC fails after
 		// a forced master rebuild (the param table just changed), so we go straight to the asset on disk.
-		// Files were saved as /Game/MapboxLandscape/Textures/T_MapboxSat_C{X}_{Y}_Z{Z}; zoom is unknown
-		// here, so we scan the folder for any matching X/Y.
+		// Files were saved as /Game/MapboxLandscape/Textures/{LevelName}/T_MapboxSat_C{X}_{Y}_Z{Z};
+		// zoom is unknown here, so we scan the level-specific folder for any matching X/Y. We also fall
+		// back to scanning the root and any sibling folder, so old assets from before the per-level
+		// segregation still get picked up.
 		UTexture2D* SatTexture = nullptr;
 		{
 			const FString Prefix = FString::Printf(TEXT("T_MapboxSat_C%d_%d_Z"), ChunkX, ChunkY);
+			const FString LevelFolder = GetLevelSubfolder();
 
 			IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 			TArray<FAssetData> AssetsInFolder;
-			AssetRegistry.GetAssetsByPath(FName(TEXT("/Game/MapboxLandscape/Textures")), AssetsInFolder, /*bRecursive=*/false);
+			AssetRegistry.GetAssetsByPath(FName(*FString::Printf(TEXT("/Game/MapboxLandscape/Textures/%s"), *LevelFolder)),
+				AssetsInFolder, /*bRecursive=*/false);
+			if (AssetsInFolder.IsEmpty())
+			{
+				// Fall back to recursive scan under the root in case textures were saved before this segregation.
+				AssetRegistry.GetAssetsByPath(FName(TEXT("/Game/MapboxLandscape/Textures")), AssetsInFolder, /*bRecursive=*/true);
+			}
 
 			for (const FAssetData& Asset : AssetsInFolder)
 			{
@@ -367,8 +337,8 @@ void UMapboxImporterConfig::FixExistingLandscapeMaterials()
 
 			if (!SatTexture)
 			{
-				UE_LOG(LogMapbox, Warning, TEXT("Mapbox: %s has no matching T_MapboxSat_C%d_%d_Z* in /Game/MapboxLandscape/Textures/. Material will render with default texture."),
-					*Landscape->GetActorLabel(), ChunkX, ChunkY);
+				UE_LOG(LogMapbox, Warning, TEXT("Mapbox: %s has no matching T_MapboxSat_C%d_%d_Z* in /Game/MapboxLandscape/Textures/%s/. Material will render with default texture."),
+					*Landscape->GetActorLabel(), ChunkX, ChunkY, *LevelFolder);
 			}
 		}
 
@@ -517,7 +487,9 @@ int32 UMapboxImporterConfig::PickAutoZoom(double DegreesPerSide) const
 	const double TargetTiles = FMath::Sqrt((double)MaxLandscapesTotal) * (double)TilesPerLandscapeSide;
 	// At zoom Z, tile_size_deg = 360 / 2^Z (in longitude). Solve 2^Z = TargetTiles * 360/DegreesPerSide.
 	const double DesiredPow2 = TargetTiles * 360.0 / FMath::Max(DegreesPerSide, 1e-6);
-	int32 Z = FMath::Clamp((int32)FMath::FloorToInt(FMath::Loge(DesiredPow2) / FMath::Loge(2.0)), 8, 16);
+	// Clamp at 15: Mapbox terrain-RGB v4 stops serving above z15, and going higher results in a flat
+	// landscape because every height tile 404s.
+	int32 Z = FMath::Clamp((int32)FMath::FloorToInt(FMath::Loge(DesiredPow2) / FMath::Loge(2.0)), 8, 15);
 	return Z;
 }
 
@@ -546,8 +518,23 @@ void UMapboxImporterConfig::EnumerateTiles(double N, double S, double E, double 
 	}
 
 	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
-	TotalExpectedBlobs = (MaxTileX - MinTileX + 1) * (MaxTileY - MinTileY + 1) *
-		(2 + (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0) + (bNeedVector ? 1 : 0));
+	const bool bHasColorLayer = [this]() {
+		for (const FMapboxLayerDef& L : MapboxLayers)
+		{
+			if (L.MatchMode != EMapboxLayerMatchMode::Vector) return true;
+		}
+		return false;
+	}();
+	// Mapbox terrain-RGB v4 caps at zoom 15. If sat zoom + bonus would exceed that, clamp the bonus down
+	// so height tiles still resolve (otherwise every height tile 404s and the landscape comes out flat).
+	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
+	const int32 HZScale = 1 << HZB;
+	const int32 SatTileCount = (MaxTileX - MinTileX + 1) * (MaxTileY - MinTileY + 1);
+	const int32 HeightTileCount = SatTileCount * HZScale * HZScale;
+	TotalExpectedBlobs = HeightTileCount
+		+ (bHasColorLayer ? SatTileCount : 0)
+		+ (SatelliteMode != EMapboxSatelliteMode::None ? SatTileCount : 0)
+		+ (bNeedVector ? SatTileCount : 0);
 
 	// Build chunks
 	Chunks.Reset();
@@ -604,8 +591,33 @@ void UMapboxImporterConfig::FetchLandscape()
 		return;
 	}
 
+	// Sanity: need an editor world to spawn actors into. WP isn't strictly required for the fetch to run —
+	// the chunks spawn as standalone ALandscape actors which work in any level — but it IS required if you
+	// want to convert to streaming proxies (Build > World Partition > Convert Landscape) after the fetch.
+	// So we emit an Info-level heads-up on non-WP levels rather than a hard error.
+	{
+		UWorld* PreflightWorld = GetWorld();
+		if (!PreflightWorld)
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Error,
+				TEXT("Mapbox: no editor world available."),
+				TEXT("Open a level before running Fetch."),
+				/*bModal=*/true);
+			FinishFetch();
+			return;
+		}
+		if (!PreflightWorld->GetWorldPartition())
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Info,
+				TEXT("Mapbox: this level is not World Partition."),
+				TEXT("Fetch will still work — chunks spawn as standalone ALandscape actors. To get streaming "
+				     "(distant chunks unload), either start from an Open World level template, or convert "
+				     "after fetch via Build > World Partition > Convert Landscape."));
+		}
+	}
+
 	const double DegSide = FMath::Max(N - S, (E - W) * FMath::Cos(FMath::DegreesToRadians((N + S) * 0.5)));
-	ResolvedZoom = bAutoZoom ? PickAutoZoom(DegSide) : FMath::Clamp(ZoomLevel, 8, 18);
+	ResolvedZoom = bAutoZoom ? PickAutoZoom(DegSide) : FMath::Clamp(ZoomLevel, 8, 15);
 
 	EnumerateTiles(N, S, E, W, ResolvedZoom);
 
@@ -639,18 +651,146 @@ void UMapboxImporterConfig::FetchLandscape()
 		return;
 	}
 
+	// Pre-flight memory budget. Aborts before we start downloads if the working set would crowd out the OS.
+	// Better to refuse politely than to bring the editor down. We model two pools:
+	//   • Transient: in-flight tile blobs, one chunk's scratch buffers, satellite textures saved as assets.
+	//   • Steady-state: each spawned ALandscape holds its own LandscapeComponent UObjects + heightmap/weightmap
+	//     UTexture2Ds that the engine packs and KEEPS RESIDENT (you can't GC them — they're owned by the actor).
+	//     Empirically ~70 MB per landscape at default settings (16x16 components × ~1 MB packed heightmap/weightmap
+	//     pair each, plus component data). This is the real reason large fetches blow up: 169 landscapes ≈ 12 GB
+	//     resident, dwarfing the 80 MB-per-chunk transient peak.
+	{
+		const FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
+		const double AvailableMB = (double)MemStats.AvailablePhysical / (1024.0 * 1024.0);
+		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+		const int32 KindsPerTile = 2
+			+ (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0)
+			+ (bNeedVector ? 1 : 0);
+		const int32 HeightTileMultiplier = (1 << FMath::Clamp(HeightZoomBonus, 0, 2)); // 1, 4, or 16
+		const int32 HeightTileCount = TotalTiles * HeightTileMultiplier * HeightTileMultiplier;
+		const int32 TotalRequests = HeightTileCount + TotalTiles * (KindsPerTile - 1);
+
+		// --- TRANSIENT ---
+		const double TilesMB = TotalRequests * 0.06;                 // ~60 KB / encoded tile (PNG/MVT)
+		const double PeakChunkScratchMB = 80.0;                       // one chunk's working buffers
+		const double SatTexMB = (SatelliteMode != EMapboxSatelliteMode::None)
+			? LandscapeCount * 1.5 : 0.0;                             // BC7 512² cooked, kept loaded after save
+
+		// --- STEADY-STATE: the heavy hitter. Each ALandscape keeps its components + packed h/w textures resident. ---
+		const double PerLandscapeResidentMB = 70.0;                   // measured at default 16×16 component grid
+		const double LandscapeResidentMB = LandscapeCount * PerLandscapeResidentMB;
+
+		const double EstPeakMB = TilesMB + PeakChunkScratchMB + SatTexMB + LandscapeResidentMB;
+
+		UE_LOG(LogMapbox, Log, TEXT("Mapbox: pre-flight peak=%.0f MB (tiles=%.0f, 1 chunk=%.0f, sat=%.0f, %d landscapes resident=%.0f), %d HTTP requests, vs available=%.0f MB"),
+			EstPeakMB, TilesMB, PeakChunkScratchMB, SatTexMB, LandscapeCount, LandscapeResidentMB, TotalRequests, AvailableMB);
+
+		if (EstPeakMB > AvailableMB * 0.7)
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Error,
+				FString::Printf(TEXT("Mapbox: estimated ~%.0f MB needed (%.0f MB just to keep %d landscapes resident); only ~%.0f MB free."),
+					EstPeakMB, LandscapeResidentMB, LandscapeCount, AvailableMB),
+				FString::Printf(TEXT("Each standalone ALandscape resident cost is ~%.0f MB. Streaming proxies would fix this but UE5.7's per-chunk import path can't produce them directly (engine constraint). Workarounds:\n"
+				                     "  • Reduce Radius Km until LandscapeCount × 70 MB fits in available RAM\n"
+				                     "  • Raise Tiles Per Landscape Side (currently %d) — fewer, larger landscapes\n"
+				                     "  • Close other apps to free RAM\n"
+				                     "  • Fetch sub-regions separately and convert each via Build > World Partition > Convert Landscape, freeing the previous before importing the next"),
+					PerLandscapeResidentMB, TilesPerLandscapeSide),
+				/*bModal=*/true);
+			FinishFetch();
+			return;
+		}
+
+		// Soft warning at >50% projected use — still proceeds, just tells the user what's coming.
+		if (EstPeakMB > AvailableMB * 0.5)
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+				FString::Printf(TEXT("Mapbox: this fetch will use ~%.0f MB of ~%.0f MB free."),
+					EstPeakMB, AvailableMB),
+				FString::Printf(TEXT("%d landscapes × ~%.0f MB resident = %.0f MB that won't free until you delete them. Expect the OS to issue a memory-pressure toast as we approach the limit; you can cancel mid-fetch if it gets dicey."),
+					LandscapeCount, PerLandscapeResidentMB, LandscapeResidentMB));
+		}
+
+		// Soft cap on total HTTP requests. Anything > 5000 will spend tens of minutes against Mapbox's rate limit,
+		// so surface a heads-up. Info severity (not warning) — this isn't an error, just a "go grab coffee" notice.
+		if (TotalRequests > 5000)
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Info,
+				FString::Printf(TEXT("Mapbox: %d HTTP requests queued — expect ~%.0f min of downloads."),
+					TotalRequests, (double)TotalRequests / 600.0),
+				TEXT("Mapbox rate-limits ~600 requests/min. Click 'Cancel Fetch' if this is too slow; reduce Radius Km, raise Tiles Per Landscape Side, lower HeightZoomBonus, or fetch sub-regions separately."));
+		}
+	}
+
+	CompletedBlobCount = 0;
+	LastReportedProgressBlobs = 0;
+	FailedHeightBlobs = 0;
+
 	StartNextDownloads();
+}
+
+void UMapboxImporterConfig::CancelFetch()
+{
+	if (!bIsFetching)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Info, TEXT("Mapbox: no fetch in progress to cancel."));
+		return;
+	}
+	bCancelRequested = true;
+	PendingDownloadQueue.Reset();
+	MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+		TEXT("Mapbox: cancellation requested."),
+		TEXT("In-flight HTTP requests will complete but no further tiles will be dispatched. Processing aborts as soon as the last in-flight tile returns."));
 }
 
 void UMapboxImporterConfig::StartNextDownloads()
 {
+	if (bCancelRequested)
+	{
+		// Stop issuing new requests. Once the last in-flight one returns we drop straight into finalize.
+		if (InFlightRequests == 0)
+		{
+			MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+				FString::Printf(TEXT("Mapbox: fetch cancelled (%d/%d tiles downloaded)."),
+					CompletedBlobCount, TotalExpectedBlobs));
+			FinishFetch();
+		}
+		return;
+	}
+
 	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+	const bool bHasColorLayer = [this]() {
+		for (const FMapboxLayerDef& L : MapboxLayers)
+		{
+			if (L.MatchMode != EMapboxLayerMatchMode::Vector) return true;
+		}
+		return false;
+	}();
+	// Mapbox terrain-RGB v4 caps at zoom 15. If sat zoom + bonus would exceed that, clamp the bonus down
+	// so height tiles still resolve (otherwise every height tile 404s and the landscape comes out flat).
+	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
+	const int32 HZScale = 1 << HZB; // 1, 2, or 4 — height tiles per satellite-tile side
 
 	while (InFlightRequests < MaxConcurrentRequests && PendingDownloadQueue.Num() > 0)
 	{
 		FTileCoord Coord = PendingDownloadQueue.Pop(EAllowShrinking::No);
-		StartRequest(Coord, ETileKind::Height);
-		StartRequest(Coord, ETileKind::Metadata);
+
+		// Height: at zoom Z+HZB, each sat tile maps to HZScale^2 sub-tiles.
+		for (int32 dy = 0; dy < HZScale; ++dy)
+		for (int32 dx = 0; dx < HZScale; ++dx)
+		{
+			FTileCoord HCoord;
+			HCoord.X = Coord.X * HZScale + dx;
+			HCoord.Y = Coord.Y * HZScale + dy;
+			HCoord.Z = Coord.Z + HZB;
+			StartRequest(HCoord, ETileKind::Height);
+		}
+
+		// Metadata only needed if at least one layer uses color matching.
+		if (bHasColorLayer)
+		{
+			StartRequest(Coord, ETileKind::Metadata);
+		}
 		if (SatelliteMode != EMapboxSatelliteMode::None)
 		{
 			StartRequest(Coord, ETileKind::Satellite);
@@ -723,8 +863,24 @@ void UMapboxImporterConfig::OnTileResponse(FHttpRequestPtr Request, FHttpRespons
 	{
 		UE_LOG(LogMapbox, Warning, TEXT("Mapbox: tile fetch failed kind=%d at %d/%d code=%d"),
 			(int32)Kind, Coord.X, Coord.Y, Response.IsValid() ? Response->GetResponseCode() : 0);
+		if (Kind == ETileKind::Height) { ++FailedHeightBlobs; }
 	}
 	CompletedBlobs.Add(KeyFor(Coord.X, Coord.Y, Kind), MoveTemp(Blob));
+
+	++CompletedBlobCount;
+	// Emit a progress toast roughly every 5% of total expected, capped at one per ~200 tiles so we don't
+	// flood the notification stack on small fetches.
+	if (TotalExpectedBlobs > 0)
+	{
+		const int32 ReportEvery = FMath::Max(200, TotalExpectedBlobs / 20);
+		if (CompletedBlobCount - LastReportedProgressBlobs >= ReportEvery || CompletedBlobCount == TotalExpectedBlobs)
+		{
+			LastReportedProgressBlobs = CompletedBlobCount;
+			const double Pct = 100.0 * (double)CompletedBlobCount / (double)TotalExpectedBlobs;
+			MapboxUI::Notify(MapboxUI::ESeverity::Info,
+				FString::Printf(TEXT("Mapbox: %d/%d tiles downloaded (%.0f%%)"), CompletedBlobCount, TotalExpectedBlobs, Pct));
+		}
+	}
 
 	StartNextDownloads();
 }
@@ -791,9 +947,15 @@ int32 UMapboxImporterConfig::ClassifyPixel(const FColor& Pixel) const
 	float BestScore = MAX_FLT;
 	int32 BestPriority = -1;
 
+	static const FName ClearLayerName(TEXT("Clear"));
+
 	for (int32 i = 0; i < MapboxLayers.Num(); ++i)
 	{
 		const FMapboxLayerDef& L = MapboxLayers[i];
+		// "Clear" is a hand-paint-only layer (used to carve holes / hide sections). Never let it match
+		// automatic classification — its zero-tolerance black target would otherwise match every
+		// default-initialized (unfetched / black) metadata pixel and win on priority.
+		if (L.LayerName == ClearLayerName) continue;
 		float Score = MAX_FLT;
 		if (L.ColorSpace == EMapboxColorSpace::RGB)
 		{
@@ -830,7 +992,8 @@ UTexture2D* UMapboxImporterConfig::SaveTransientToAsset(const TArray<FColor>& Pi
 #if WITH_EDITOR
 	if (Pixels.Num() != W * H) return nullptr;
 
-	const FString PackagePath = FString::Printf(TEXT("/Game/MapboxLandscape/Textures/%s"), *AssetName);
+	const FString LevelFolder = GetLevelSubfolder();
+	const FString PackagePath = FString::Printf(TEXT("/Game/MapboxLandscape/Textures/%s/%s"), *LevelFolder, *AssetName);
 	UPackage* Package = CreatePackage(*PackagePath);
 	if (!Package) return nullptr;
 	Package->FullyLoad();
@@ -838,9 +1001,14 @@ UTexture2D* UMapboxImporterConfig::SaveTransientToAsset(const TArray<FColor>& Pi
 	UTexture2D* Texture = NewObject<UTexture2D>(Package, *AssetName, RF_Public | RF_Standalone);
 	Texture->Source.Init(W, H, 1, 1, TSF_BGRA8, reinterpret_cast<const uint8*>(Pixels.GetData()));
 	Texture->SRGB = true;
-	Texture->CompressionSettings = TC_Default;
+	// BC7 is high-quality color compression at ~1 byte/pixel — visually near-lossless for satellite imagery,
+	// which we use only as a material-classification hint anyway.
+	Texture->CompressionSettings = TC_BC7;
 	Texture->LODGroup = TEXTUREGROUP_World;
 	Texture->MipGenSettings = TMGS_FromTextureGroup;
+	Texture->MaxTextureSize = 1024;   // cap streamed mip pyramid; we resampled the source to 512 already.
+	Texture->LODBias = 1;             // don't load the highest mip until camera is close.
+	Texture->NeverStream = false;
 	Texture->PostEditChange();
 	Texture->UpdateResource();
 
@@ -852,6 +1020,12 @@ UTexture2D* UMapboxImporterConfig::SaveTransientToAsset(const TArray<FColor>& Pi
 	FSavePackageArgs SaveArgs;
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
+
+	// Drop the Source bulk data after the package is on disk. The Texture stays renderable from compiled
+	// platform data; we just don't keep the raw uncompressed BGRA in memory or in the uasset. This shaves
+	// ~1.3 MB per chunk of steady-state RAM (and the same in uasset size).
+	Texture->Source.Init(0, 0, 0, 0, TSF_Invalid, nullptr);
+
 	return Texture;
 #else
 	return nullptr;
@@ -884,8 +1058,9 @@ UMaterialInstanceConstant* UMapboxImporterConfig::CreateMaterialInstanceForChunk
 #if WITH_EDITOR
 	if (!Master) return nullptr;
 
+	const FString LevelFolder = GetLevelSubfolder();
 	const FString AssetName = FString::Printf(TEXT("MI_MapboxLandscape_C%d_%d"), ChunkX, ChunkY);
-	const FString PackagePath = FString::Printf(TEXT("/Game/MapboxLandscape/MaterialInstances/%s"), *AssetName);
+	const FString PackagePath = FString::Printf(TEXT("/Game/MapboxLandscape/MaterialInstances/%s/%s"), *LevelFolder, *AssetName);
 
 	UPackage* Package = CreatePackage(*PackagePath);
 	if (!Package) return nullptr;
@@ -968,31 +1143,50 @@ UPCGGraphInterface* UMapboxImporterConfig::GetOrGenerateScatterGraph()
 
 // ----- Main processing -------------------------------------------------------
 
+// Catmull-Rom cubic interpolant (a=-0.5 gives Catmull-Rom spline).
+static FORCEINLINE float CubicCatmullRom(float p0, float p1, float p2, float p3, float t)
+{
+	const float a = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+	const float b =        p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+	const float c = -0.5f * p0              + 0.5f * p2;
+	const float d =                 p1;
+	return ((a * t + b) * t + c) * t + d;
+}
+
+// Bicubic Catmull-Rom resample. Smoother slope continuity than bilinear — visible improvement on
+// cliff edges and steep terrain features. Constant 16-tap cost, still O(DstW * DstH).
 static void ResampleHeights(const TArray<float>& Src, int32 SrcW, int32 SrcH,
                              TArray<float>& Dst, int32 DstW, int32 DstH)
 {
 	Dst.SetNumUninitialized(DstW * DstH);
 	const float SX = (float)(SrcW - 1) / FMath::Max(1, DstW - 1);
 	const float SY = (float)(SrcH - 1) / FMath::Max(1, DstH - 1);
+
+	auto At = [&](int32 X, int32 Y) -> float
+	{
+		const int32 cx = FMath::Clamp(X, 0, SrcW - 1);
+		const int32 cy = FMath::Clamp(Y, 0, SrcH - 1);
+		return Src[cy * SrcW + cx];
+	};
+
 	for (int32 y = 0; y < DstH; ++y)
 	{
 		const float fy = y * SY;
 		const int32 y0 = FMath::FloorToInt(fy);
-		const int32 y1 = FMath::Min(y0 + 1, SrcH - 1);
 		const float ty = fy - y0;
 		for (int32 x = 0; x < DstW; ++x)
 		{
 			const float fx = x * SX;
 			const int32 x0 = FMath::FloorToInt(fx);
-			const int32 x1 = FMath::Min(x0 + 1, SrcW - 1);
 			const float tx = fx - x0;
-			const float A = Src[y0 * SrcW + x0];
-			const float B = Src[y0 * SrcW + x1];
-			const float C = Src[y1 * SrcW + x0];
-			const float D = Src[y1 * SrcW + x1];
-			const float AB = FMath::Lerp(A, B, tx);
-			const float CD = FMath::Lerp(C, D, tx);
-			Dst[y * DstW + x] = FMath::Lerp(AB, CD, ty);
+
+			// 4 horizontal cubics across 4 rows, then 1 vertical cubic across results.
+			const float Row0 = CubicCatmullRom(At(x0 - 1, y0 - 1), At(x0, y0 - 1), At(x0 + 1, y0 - 1), At(x0 + 2, y0 - 1), tx);
+			const float Row1 = CubicCatmullRom(At(x0 - 1, y0    ), At(x0, y0    ), At(x0 + 1, y0    ), At(x0 + 2, y0    ), tx);
+			const float Row2 = CubicCatmullRom(At(x0 - 1, y0 + 1), At(x0, y0 + 1), At(x0 + 1, y0 + 1), At(x0 + 2, y0 + 1), tx);
+			const float Row3 = CubicCatmullRom(At(x0 - 1, y0 + 2), At(x0, y0 + 2), At(x0 + 1, y0 + 2), At(x0 + 2, y0 + 2), tx);
+
+			Dst[y * DstW + x] = CubicCatmullRom(Row0, Row1, Row2, Row3, ty);
 		}
 	}
 }
@@ -1127,120 +1321,323 @@ static void RasterPolygonRing(TArray<uint8>& Mask, int32 W, int32 H, const TArra
 
 void UMapboxImporterConfig::OnAllTilesDownloaded()
 {
-	// Compute global min elevation across all height tiles for a shared baseline.
+	if (bCancelRequested)
+	{
+		FinishFetch();
+		return;
+	}
+
+	if (FailedHeightBlobs > 0)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			FString::Printf(TEXT("Mapbox: %d height tile(s) failed to download."), FailedHeightBlobs),
+			TEXT("Missing height tiles will appear as flat patches at sea level. Check the Output Log for HTTP error codes (404 typically means the zoom is above Mapbox's terrain-RGB cap of 15; 401 = bad token; 429 = rate-limited)."));
+	}
+
+	// Mapbox terrain-RGB v4 caps at zoom 15. If sat zoom + bonus would exceed that, clamp the bonus down
+	// so height tiles still resolve (otherwise every height tile 404s and the landscape comes out flat).
+	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
+	const int32 HZScale = 1 << HZB;
+
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+	const bool bHasColorLayer = [this]() {
+		for (const FMapboxLayerDef& L : MapboxLayers)
+		{
+			if (L.MatchMode != EMapboxLayerMatchMode::Vector) return true;
+		}
+		return false;
+	}();
+	const bool bSatEnabled = (SatelliteMode != EMapboxSatelliteMode::None);
+
+	// Find the special "Clear" layer (case-insensitive). If present, it gets:
+	// - Always added to ActiveLayerIndices (so user can hand-paint it even if classification never matches).
+	// - Its winning pixels collapse the heightmap to baseline (carved hill / hole).
+	int32 ClearLayerIdx = INDEX_NONE;
+	for (int32 i = 0; i < MapboxLayers.Num(); ++i)
+	{
+		if (MapboxLayers[i].LayerName.IsEqual(FName(TEXT("Clear"))))
+		{
+			ClearLayerIdx = i;
+			break;
+		}
+	}
+
+	// Reusable per-tile decode buffer. Hoisted out of the inner loops so we don't reallocate
+	// 4 KB...256 KB once per tile per kind. Cleared between uses with Reset() (keeps allocation).
+	TArray<uint8> ScratchRGBA;
+
+	// ---- Pass A: scan ALL height blobs for global min/max. Don't cache decoded floats
+	// (~64 KB/tile × 676 tiles would be ~43 MB). Don't remove blobs yet — chunk pass needs them.
 	float GlobalMin = FLT_MAX;
 	float GlobalMax = -FLT_MAX;
 
-	for (int32 X = MinTileX; X <= MaxTileX; ++X)
+	const int32 HMinX = MinTileX * HZScale;
+	const int32 HMaxX = (MaxTileX + 1) * HZScale - 1;
+	const int32 HMinY = MinTileY * HZScale;
+	const int32 HMaxY = (MaxTileY + 1) * HZScale - 1;
+
+	for (int32 X = HMinX; X <= HMaxX; ++X)
+	for (int32 Y = HMinY; Y <= HMaxY; ++Y)
 	{
-		for (int32 Y = MinTileY; Y <= MaxTileY; ++Y)
+		FTileBlob* Blob = CompletedBlobs.Find(KeyFor(X, Y, ETileKind::Height));
+		if (!Blob || !Blob->bOk) continue;
+		ScratchRGBA.Reset();
+		int32 W = 0, H = 0;
+		if (!DecodeTileToRGBA(Blob->Bytes, ScratchRGBA, W, H)) continue;
+		const int32 Pixels = W * H;
+		for (int32 i = 0; i < Pixels; ++i)
 		{
-			FTileBlob* Blob = CompletedBlobs.Find(KeyFor(X, Y, ETileKind::Height));
-			if (!Blob || !Blob->bOk) continue;
-			TArray<uint8> RGBA; int32 W = 0, H = 0;
-			if (!DecodeTileToRGBA(Blob->Bytes, RGBA, W, H)) continue;
-			const int32 Pixels = W * H;
-			for (int32 i = 0; i < Pixels; ++i)
-			{
-				const float M = DecodeHeightMeters(RGBA[i * 4 + 0], RGBA[i * 4 + 1], RGBA[i * 4 + 2]);
-				if (M < GlobalMin) GlobalMin = M;
-				if (M > GlobalMax) GlobalMax = M;
-			}
+			const float M = DecodeHeightMeters(ScratchRGBA[i * 4 + 0], ScratchRGBA[i * 4 + 1], ScratchRGBA[i * 4 + 2]);
+			if (M < GlobalMin) GlobalMin = M;
+			if (M > GlobalMax) GlobalMax = M;
 		}
 	}
 	if (GlobalMin == FLT_MAX) { GlobalMin = 0.f; GlobalMax = 0.f; }
+
 	const float BaselineMeters = bRebaseToSeaLevel ? 0.f : GlobalMin;
 	const float RangeMeters = FMath::Max(50.f, (GlobalMax - BaselineMeters) * ZExaggeration + 1.f);
 	UE_LOG(LogMapbox, Log, TEXT("Mapbox: elevation min=%.1fm max=%.1fm baseline=%.1f range=%.1f"),
 		GlobalMin, GlobalMax, BaselineMeters, RangeMeters);
 
-	// Compute landscape Z scale so that GlobalMax fits within ±256m * (ZScale/100).
-	// HeightValue = (Meters - Baseline) * ZExaggeration * (100 / ZScale_factor) * 128/100 + 32768
-	// We want max HeightValue = 65535. Solve: ZScale = ceil((MaxMeters - Baseline) * ZExaggeration * 128 / 32767) * 100
 	const float LandscapeZScale = FMath::Max(100.f, RangeMeters * 100.f * 128.f / 32767.f);
 	UE_LOG(LogMapbox, Log, TEXT("Mapbox: chosen landscape Z scale = %.2f"), LandscapeZScale);
 
 	const double CenterLat = (TileYToLat(MinTileY, ResolvedZoom) + TileYToLat(MaxTileY + 1, ResolvedZoom)) * 0.5;
 	const double TileSideMeters = MetersPerTileSide(CenterLat, ResolvedZoom);
-	const double WorldCmPerSourcePixel = (TileSideMeters / 256.0) * 100.0; // cm/source-pixel
+	const double WorldCmPerSourcePixel = (TileSideMeters / 256.0) * 100.0; // cm/source-pixel (sat zoom)
 	const double TileWorldCm = 256.0 * WorldCmPerSourcePixel;
 	const int32 TilesXAll = MaxTileX - MinTileX + 1;
 	const int32 TilesYAll = MaxTileY - MinTileY + 1;
 	const double TotalWorldX = TilesXAll * TileWorldCm;
 	const double TotalWorldY = TilesYAll * TileWorldCm;
 
-	// Process each chunk
 	GeneratedLandscapes.Reset();
 
-	for (const FLandscapeChunk& Chunk : Chunks)
+	// ---- Pass B: chunk loop. Each chunk decodes its tiles, builds the landscape, and frees
+	// everything before the next iteration. Blobs are removed from CompletedBlobs as soon as
+	// they're consumed, so by chunk N the map only retains tiles for chunks N+1..end.
+	FScopedSlowTask SlowTask((float)Chunks.Num(), FText::FromString(TEXT("Mapbox: building landscapes...")));
+	SlowTask.MakeDialog(/*bShowCancelButton=*/false);
+
+	// Scratch buffers reused across chunks (.Empty() at end of iteration releases backing memory).
+	TArray<float> SrcHeightsMeters;
+	TArray<FColor> SrcMetadata;
+	TArray<FColor> SrcSatellite;
+	TArray<float> ResampledHeights;
+	TArray<FColor> ResampledMeta;
+	TArray<uint16> Heightmap;
+	TArray<int32> WinnerLayer;
+	TArray<int32> WinnerPriority;
+	TArray<TArray<uint8>> VectorMasksAtLandscapeRes; // size == MapboxLayers.Num(), empty entries unused
+
+	for (int32 ChunkIdx = 0; ChunkIdx < Chunks.Num(); ++ChunkIdx)
 	{
+		if (bCancelRequested)
+		{
+			UE_LOG(LogMapbox, Warning, TEXT("Mapbox: cancellation requested during chunk processing — bailing after %d chunks."), ChunkIdx);
+			break;
+		}
+
+		const FLandscapeChunk& Chunk = Chunks[ChunkIdx];
+		SlowTask.EnterProgressFrame(1.f,
+			FText::FromString(FString::Printf(TEXT("Mapbox chunk %d/%d (%d,%d)"),
+				ChunkIdx + 1, Chunks.Num(), Chunk.ChunkX, Chunk.ChunkY)));
+
 		const int32 SrcW = Chunk.TilesX * 256;
 		const int32 SrcH = Chunk.TilesY * 256;
+		const int32 SrcW_H = SrcW * HZScale; // height source resolution (higher when HZB>0)
+		const int32 SrcH_H = SrcH * HZScale;
 
-		TArray<float> SrcHeightsMeters; SrcHeightsMeters.SetNumZeroed(SrcW * SrcH);
-		TArray<FColor> SrcMetadata; SrcMetadata.SetNumZeroed(SrcW * SrcH);
-		TArray<FColor> SrcSatellite; SrcSatellite.SetNumZeroed(SrcW * SrcH);
+		SrcHeightsMeters.SetNumZeroed(SrcW_H * SrcH_H);
+		if (bHasColorLayer) { SrcMetadata.SetNumZeroed(SrcW * SrcH); }
+		if (bSatEnabled)    { SrcSatellite.SetNumZeroed(SrcW * SrcH); }
 
 		bool bMissing = false;
-		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
-		{
-			for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
-			{
-				const int32 TileX = Chunk.MinTileX + tx;
-				const int32 TileY = Chunk.MinTileY + ty;
-				const int32 BaseX = tx * 256;
-				const int32 BaseY = ty * 256;
 
-				// Height
+		// --- Decode height tiles (one per HZScale^2 sub-position per chunk sat tile) and remove blobs.
+		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
+		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
+		{
+			for (int32 hy = 0; hy < HZScale; ++hy)
+			for (int32 hx = 0; hx < HZScale; ++hx)
+			{
+				const int32 HTileX = (Chunk.MinTileX + tx) * HZScale + hx;
+				const int32 HTileY = (Chunk.MinTileY + ty) * HZScale + hy;
+				const int32 BaseX_H = (tx * HZScale + hx) * 256;
+				const int32 BaseY_H = (ty * HZScale + hy) * 256;
+
+				const FString HKey = KeyFor(HTileX, HTileY, ETileKind::Height);
+				FTileBlob* Blob = CompletedBlobs.Find(HKey);
+				if (Blob && Blob->bOk)
 				{
-					FTileBlob* Blob = CompletedBlobs.Find(KeyFor(TileX, TileY, ETileKind::Height));
-					TArray<uint8> RGBA; int32 W = 0, H = 0;
-					if (Blob && Blob->bOk && DecodeTileToRGBA(Blob->Bytes, RGBA, W, H) && W == 256 && H == 256)
+					ScratchRGBA.Reset();
+					int32 W = 0, H = 0;
+					if (DecodeTileToRGBA(Blob->Bytes, ScratchRGBA, W, H) && W == 256 && H == 256)
 					{
 						for (int32 py = 0; py < 256; ++py)
 						for (int32 px = 0; px < 256; ++px)
 						{
 							const int32 i = (py * 256 + px) * 4;
-							SrcHeightsMeters[(BaseY + py) * SrcW + (BaseX + px)] =
-								DecodeHeightMeters(RGBA[i], RGBA[i + 1], RGBA[i + 2]);
+							SrcHeightsMeters[(BaseY_H + py) * SrcW_H + (BaseX_H + px)] =
+								DecodeHeightMeters(ScratchRGBA[i], ScratchRGBA[i + 1], ScratchRGBA[i + 2]);
 						}
 					}
 					else { bMissing = true; }
 				}
+				else { bMissing = true; }
+				CompletedBlobs.Remove(HKey); // free the PNG bytes; we won't need them again
+			}
+		}
 
-				// Metadata
+		// --- Decode metadata + satellite + parse vector for chunk sat tiles, then remove blobs.
+		const double MetersPerSrcPixel = TileSideMeters / 256.0;
+		const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
+
+		// Allocate per-active-layer vector masks at LANDSCAPE resolution (not source).
+		VectorMasksAtLandscapeRes.SetNum(MapboxLayers.Num());
+		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
+		{
+			if (MapboxLayers[i].MatchMode != EMapboxLayerMatchMode::Color && !MapboxLayers[i].VectorFilters.IsEmpty())
+			{
+				VectorMasksAtLandscapeRes[i].SetNumZeroed(LandscapeVerts * LandscapeVerts);
+			}
+			else if (VectorMasksAtLandscapeRes[i].Num() > 0)
+			{
+				VectorMasksAtLandscapeRes[i].Empty();
+			}
+		}
+
+		// Pixel-to-landscape scale for vector raster (one sat tile -> LandscapeVerts/TilesX cells).
+		// Each chunk sat tile occupies LandscapePxPerTile pixels on the landscape mask.
+		const double LandscapePxPerSatTile = (double)LandscapeVerts / FMath::Max(1, Chunk.TilesX);
+
+		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
+		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
+		{
+			const int32 TileX = Chunk.MinTileX + tx;
+			const int32 TileY = Chunk.MinTileY + ty;
+			const int32 BaseX = tx * 256;
+			const int32 BaseY = ty * 256;
+
+			// Metadata
+			if (bHasColorLayer)
+			{
+				const FString MKey = KeyFor(TileX, TileY, ETileKind::Metadata);
+				FTileBlob* Blob = CompletedBlobs.Find(MKey);
+				if (Blob && Blob->bOk)
 				{
-					FTileBlob* Blob = CompletedBlobs.Find(KeyFor(TileX, TileY, ETileKind::Metadata));
-					TArray<uint8> RGBA; int32 W = 0, H = 0;
-					if (Blob && Blob->bOk && DecodeTileToRGBA(Blob->Bytes, RGBA, W, H) && W == 256 && H == 256)
+					ScratchRGBA.Reset();
+					int32 W = 0, H = 0;
+					if (DecodeTileToRGBA(Blob->Bytes, ScratchRGBA, W, H) && W == 256 && H == 256)
 					{
 						for (int32 py = 0; py < 256; ++py)
 						for (int32 px = 0; px < 256; ++px)
 						{
 							const int32 i = (py * 256 + px) * 4;
 							SrcMetadata[(BaseY + py) * SrcW + (BaseX + px)] =
-								FColor(RGBA[i], RGBA[i + 1], RGBA[i + 2], 255);
+								FColor(ScratchRGBA[i], ScratchRGBA[i + 1], ScratchRGBA[i + 2], 255);
 						}
 					}
 				}
+				CompletedBlobs.Remove(MKey);
+			}
 
-				// Satellite
-				if (SatelliteMode != EMapboxSatelliteMode::None)
+			// Satellite
+			if (bSatEnabled)
+			{
+				const FString SKey = KeyFor(TileX, TileY, ETileKind::Satellite);
+				FTileBlob* Blob = CompletedBlobs.Find(SKey);
+				if (Blob && Blob->bOk)
 				{
-					FTileBlob* Blob = CompletedBlobs.Find(KeyFor(TileX, TileY, ETileKind::Satellite));
-					TArray<uint8> RGBA; int32 W = 0, H = 0;
-					if (Blob && Blob->bOk && DecodeTileToRGBA(Blob->Bytes, RGBA, W, H) && W == 256 && H == 256)
+					ScratchRGBA.Reset();
+					int32 W = 0, H = 0;
+					if (DecodeTileToRGBA(Blob->Bytes, ScratchRGBA, W, H) && W == 256 && H == 256)
 					{
 						for (int32 py = 0; py < 256; ++py)
 						for (int32 px = 0; px < 256; ++px)
 						{
 							const int32 i = (py * 256 + px) * 4;
-							// Source RGBA -> stored as FColor in BGRA layout
 							SrcSatellite[(BaseY + py) * SrcW + (BaseX + px)] =
-								FColor(RGBA[i + 2], RGBA[i + 1], RGBA[i + 0], 255);
+								FColor(ScratchRGBA[i + 2], ScratchRGBA[i + 1], ScratchRGBA[i + 0], 255);
 						}
 					}
 				}
+				CompletedBlobs.Remove(SKey);
+			}
+
+			// Vector tiles — raster directly into landscape-resolution masks.
+			if (bNeedVector)
+			{
+				const FString VKey = KeyFor(TileX, TileY, ETileKind::Vector);
+				FTileBlob* Blob = CompletedBlobs.Find(VKey);
+				if (Blob && Blob->bOk)
+				{
+					TArray<MapboxMvt::FLayer> MvtLayers;
+					if (MapboxMvt::ParseTile(Blob->Bytes, MvtLayers))
+					{
+						const double LandscapeBaseX = tx * LandscapePxPerSatTile;
+						const double LandscapeBaseY = ty * LandscapePxPerSatTile;
+						const double LandscapeMetersPerPixel = (TileSideMeters * Chunk.TilesX) / FMath::Max(1, LandscapeVerts);
+
+						for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+						{
+							for (int32 LayerIdx = 0; LayerIdx < MapboxLayers.Num(); ++LayerIdx)
+							{
+								const FMapboxLayerDef& L = MapboxLayers[LayerIdx];
+								if (L.MatchMode == EMapboxLayerMatchMode::Color) continue;
+
+								for (const FMapboxVectorFeatureFilter& Filter : L.VectorFilters)
+								{
+									if (!Filter.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
+
+									// MVT extent->landscape-mask scale: one tile's extent maps to LandscapePxPerSatTile pixels.
+									const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
+									const int32 BrushRadius = FMath::Max(0,
+										FMath::CeilToInt(Filter.LineWidthMeters / FMath::Max(LandscapeMetersPerPixel, 0.01) / 2.0));
+
+									for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+									{
+										if (!MapboxMvt::FeatureMatchesClass(Feature, Filter.Classes)) continue;
+
+										if (Feature.Type == MapboxMvt::EFeatureType::LineString)
+										{
+											for (const TArray<FVector2D>& Line : Feature.Geometry)
+											{
+												if (Line.Num() < 2) continue;
+												int32 PrevX = (int32)(LandscapeBaseX + Line[0].X * ExtentToLandscape);
+												int32 PrevY = (int32)(LandscapeBaseY + Line[0].Y * ExtentToLandscape);
+												for (int32 p = 1; p < Line.Num(); ++p)
+												{
+													const int32 CurX = (int32)(LandscapeBaseX + Line[p].X * ExtentToLandscape);
+													const int32 CurY = (int32)(LandscapeBaseY + Line[p].Y * ExtentToLandscape);
+													RasterLine(VectorMasksAtLandscapeRes[LayerIdx], LandscapeVerts, LandscapeVerts,
+														PrevX, PrevY, CurX, CurY, BrushRadius);
+													PrevX = CurX; PrevY = CurY;
+												}
+											}
+										}
+										else if (Feature.Type == MapboxMvt::EFeatureType::Polygon)
+										{
+											for (const TArray<FVector2D>& Ring : Feature.Geometry)
+											{
+												TArray<FVector2D> Transformed;
+												Transformed.Reserve(Ring.Num());
+												for (const FVector2D& P : Ring)
+												{
+													Transformed.Add(FVector2D(LandscapeBaseX + P.X * ExtentToLandscape,
+														LandscapeBaseY + P.Y * ExtentToLandscape));
+												}
+												RasterPolygonRing(VectorMasksAtLandscapeRes[LayerIdx],
+													LandscapeVerts, LandscapeVerts, Transformed);
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				CompletedBlobs.Remove(VKey);
 			}
 		}
 
@@ -1250,152 +1647,53 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 				Chunk.ChunkX, Chunk.ChunkY);
 		}
 
-		const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
+		// --- Resample heights from (possibly higher-res) source to landscape verts.
+		ResampleHeights(SrcHeightsMeters, SrcW_H, SrcH_H, ResampledHeights, LandscapeVerts, LandscapeVerts);
+		SrcHeightsMeters.Empty(); // free the high-res heightmap source
 
-		// Resample to landscape resolution
-		TArray<float> ResampledHeights;
-		ResampleHeights(SrcHeightsMeters, SrcW, SrcH, ResampledHeights, LandscapeVerts, LandscapeVerts);
-
-		TArray<FColor> ResampledMeta;
-		ResampleColors(SrcMetadata, SrcW, SrcH, ResampledMeta, LandscapeVerts, LandscapeVerts);
-
-		// Build heightmap uint16 with chosen baseline + Z scale
-		TArray<uint16> Heightmap; Heightmap.SetNumUninitialized(LandscapeVerts * LandscapeVerts);
-		const float Numerator = 100.f * 128.f * ZExaggeration; // (cm/m) * heightmap_units/cm normalized * exaggeration
+		// Quantize to uint16 heightmap with the global Z scale.
+		Heightmap.SetNumUninitialized(LandscapeVerts * LandscapeVerts);
 		for (int32 i = 0; i < ResampledHeights.Num(); ++i)
 		{
 			const float WorldZcm = (ResampledHeights[i] - BaselineMeters) * 100.f * ZExaggeration;
 			const float Val = WorldZcm * 128.f / FMath::Max(LandscapeZScale, 1.f) + 32768.f;
 			Heightmap[i] = (uint16)FMath::Clamp(FMath::RoundToInt(Val), 0, 65535);
 		}
+		ResampledHeights.Empty();
 
-		// Rasterize matching MVT features into source-resolution per-layer masks.
-		// SrcVectorMasks[i] is populated only for layers whose MatchMode != Color.
-		TArray<TArray<uint8>> SrcVectorMasks;
-		SrcVectorMasks.SetNum(MapboxLayers.Num());
-		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
+		// --- Resample metadata for color classification, then drop the source.
+		if (bHasColorLayer)
 		{
-			if (MapboxLayers[i].MatchMode != EMapboxLayerMatchMode::Color && !MapboxLayers[i].VectorFilters.IsEmpty())
-			{
-				SrcVectorMasks[i].SetNumZeroed(SrcW * SrcH);
-			}
+			ResampleColors(SrcMetadata, SrcW, SrcH, ResampledMeta, LandscapeVerts, LandscapeVerts);
+			SrcMetadata.Empty();
 		}
 
-		if (LayersNeedVectorTiles(MapboxLayers))
+		// --- Compute WinnerLayer/Priority across color + vector candidates.
+		const int32 PixelCount = LandscapeVerts * LandscapeVerts;
+		WinnerLayer.Init(INDEX_NONE, PixelCount);
+		WinnerPriority.Init(-1, PixelCount);
+
+		if (bHasColorLayer)
 		{
-			const double MetersPerSrcPixel = TileSideMeters / 256.0;
-			for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
-			for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
+			for (int32 i = 0; i < PixelCount; ++i)
 			{
-				const int32 TileX = Chunk.MinTileX + tx;
-				const int32 TileY = Chunk.MinTileY + ty;
-				const int32 BaseX = tx * 256;
-				const int32 BaseY = ty * 256;
-
-				FTileBlob* Blob = CompletedBlobs.Find(KeyFor(TileX, TileY, ETileKind::Vector));
-				if (!Blob || !Blob->bOk) continue;
-
-				TArray<MapboxMvt::FLayer> MvtLayers;
-				if (!MapboxMvt::ParseTile(Blob->Bytes, MvtLayers)) continue;
-
-				for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+				const int32 ColorIdx = ClassifyPixel(ResampledMeta[i]);
+				if (ColorIdx != INDEX_NONE)
 				{
-					// For each of our config layers using vector matching, check filters
-					for (int32 LayerIdx = 0; LayerIdx < MapboxLayers.Num(); ++LayerIdx)
+					const FMapboxLayerDef& L = MapboxLayers[ColorIdx];
+					if (L.MatchMode != EMapboxLayerMatchMode::Vector && L.Priority > WinnerPriority[i])
 					{
-						const FMapboxLayerDef& L = MapboxLayers[LayerIdx];
-						if (L.MatchMode == EMapboxLayerMatchMode::Color) continue;
-
-						for (const FMapboxVectorFeatureFilter& Filter : L.VectorFilters)
-						{
-							if (!Filter.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
-
-							const float ExtentToPixels = 256.f / FMath::Max(1.f, (float)MvtLayer.Extent);
-							const int32 BrushRadius = FMath::Max(0,
-								FMath::CeilToInt(Filter.LineWidthMeters / FMath::Max(MetersPerSrcPixel, 0.01) / 2.0));
-
-							for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
-							{
-								if (!MapboxMvt::FeatureMatchesClass(Feature, Filter.Classes)) continue;
-
-								if (Feature.Type == MapboxMvt::EFeatureType::LineString)
-								{
-									for (const TArray<FVector2D>& Line : Feature.Geometry)
-									{
-										if (Line.Num() < 2) continue;
-										int32 PrevX = BaseX + (int32)(Line[0].X * ExtentToPixels);
-										int32 PrevY = BaseY + (int32)(Line[0].Y * ExtentToPixels);
-										for (int32 p = 1; p < Line.Num(); ++p)
-										{
-											const int32 CurX = BaseX + (int32)(Line[p].X * ExtentToPixels);
-											const int32 CurY = BaseY + (int32)(Line[p].Y * ExtentToPixels);
-											RasterLine(SrcVectorMasks[LayerIdx], SrcW, SrcH, PrevX, PrevY, CurX, CurY, BrushRadius);
-											PrevX = CurX; PrevY = CurY;
-										}
-									}
-								}
-								else if (Feature.Type == MapboxMvt::EFeatureType::Polygon)
-								{
-									for (const TArray<FVector2D>& Ring : Feature.Geometry)
-									{
-										TArray<FVector2D> Transformed;
-										Transformed.Reserve(Ring.Num());
-										for (const FVector2D& P : Ring)
-										{
-											Transformed.Add(FVector2D(BaseX + P.X * ExtentToPixels,
-												BaseY + P.Y * ExtentToPixels));
-										}
-										RasterPolygonRing(SrcVectorMasks[LayerIdx], SrcW, SrcH, Transformed);
-									}
-								}
-							}
-						}
+						WinnerPriority[i] = L.Priority;
+						WinnerLayer[i] = ColorIdx;
 					}
 				}
 			}
+			ResampledMeta.Empty();
 		}
 
-		// Resample SrcVectorMasks down to landscape resolution
-		TArray<TArray<uint8>> ResampledVectorMasks;
-		ResampledVectorMasks.SetNum(MapboxLayers.Num());
-		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
-		{
-			if (SrcVectorMasks[i].Num() > 0)
-			{
-				ResampleMask(SrcVectorMasks[i], SrcW, SrcH, ResampledVectorMasks[i], LandscapeVerts, LandscapeVerts);
-			}
-		}
-
-		// Build per-layer weightmaps with priority-based merge of color and vector matches.
-		TMap<FName, TArray<uint8>> LayerWeights;
-		for (const FMapboxLayerDef& L : MapboxLayers)
-		{
-			LayerWeights.Add(L.LayerName).SetNumZeroed(LandscapeVerts * LandscapeVerts);
-		}
-
-		const int32 PixelCount = LandscapeVerts * LandscapeVerts;
-		TArray<int32> WinnerLayer; WinnerLayer.Init(INDEX_NONE, PixelCount);
-		TArray<int32> WinnerPriority; WinnerPriority.Init(-1, PixelCount);
-
-		// Color candidates
-		for (int32 i = 0; i < PixelCount; ++i)
-		{
-			const int32 ColorIdx = ClassifyPixel(ResampledMeta[i]);
-			if (ColorIdx != INDEX_NONE)
-			{
-				const FMapboxLayerDef& L = MapboxLayers[ColorIdx];
-				if (L.MatchMode != EMapboxLayerMatchMode::Vector && L.Priority > WinnerPriority[i])
-				{
-					WinnerPriority[i] = L.Priority;
-					WinnerLayer[i] = ColorIdx;
-				}
-			}
-		}
-
-		// Vector candidates
 		for (int32 LayerIdx = 0; LayerIdx < MapboxLayers.Num(); ++LayerIdx)
 		{
-			const TArray<uint8>& M = ResampledVectorMasks[LayerIdx];
+			const TArray<uint8>& M = VectorMasksAtLandscapeRes[LayerIdx];
 			if (M.Num() == 0) continue;
 			const FMapboxLayerDef& L = MapboxLayers[LayerIdx];
 			for (int32 i = 0; i < PixelCount; ++i)
@@ -1407,29 +1705,76 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 				}
 			}
 		}
+		// Free vector masks now — we have everything we need in WinnerLayer.
+		for (TArray<uint8>& M : VectorMasksAtLandscapeRes) { M.Empty(); }
 
-		// Write winners to layer weight maps
+		// --- Determine active layers (any layer that's a winner anywhere). Skip allocating
+		// weightmaps + ULandscapeLayerInfoObjects for unused layers — huge memory + UObject win.
+		TSet<int32> ActiveLayerIndices;
 		for (int32 i = 0; i < PixelCount; ++i)
 		{
 			if (WinnerLayer[i] != INDEX_NONE)
 			{
-				LayerWeights[MapboxLayers[WinnerLayer[i]].LayerName][i] = 255;
+				ActiveLayerIndices.Add(WinnerLayer[i]);
+			}
+		}
+		// Force-add Clear so the user can hand-paint it even if classification never matched it.
+		if (ClearLayerIdx != INDEX_NONE)
+		{
+			ActiveLayerIndices.Add(ClearLayerIdx);
+		}
+
+		// --- Build per-layer weight maps for active layers only.
+		TMap<FName, TArray<uint8>> LayerWeights;
+		for (int32 LayerIdx : ActiveLayerIndices)
+		{
+			LayerWeights.Add(MapboxLayers[LayerIdx].LayerName).SetNumZeroed(PixelCount);
+		}
+		for (int32 i = 0; i < PixelCount; ++i)
+		{
+			const int32 W = WinnerLayer[i];
+			if (W != INDEX_NONE)
+			{
+				LayerWeights[MapboxLayers[W].LayerName][i] = 255;
 			}
 		}
 
-		// Satellite texture asset
-		UTexture2D* SatTexture = nullptr;
-		if (SatelliteMode != EMapboxSatelliteMode::None)
+		// --- Clear-layer heightmap carve: flatten any "Clear" winning pixel to the baseline,
+		// so carved areas don't poke into the rendered terrain through the masked material.
+		if (ClearLayerIdx != INDEX_NONE)
 		{
+			for (int32 i = 0; i < PixelCount; ++i)
+			{
+				if (WinnerLayer[i] == ClearLayerIdx)
+				{
+					Heightmap[i] = 32768; // == BaselineMeters in our encoding
+				}
+			}
+		}
+
+		// Free winner arrays before we spawn the landscape.
+		WinnerLayer.Empty();
+		WinnerPriority.Empty();
+
+		// --- Satellite texture: resample to a fixed 512x512 (visual-only, just feeds material).
+		UTexture2D* SatTexture = nullptr;
+		if (bSatEnabled && SrcSatellite.Num() > 0)
+		{
+			constexpr int32 SatTexSize = 512;
 			TArray<FColor> ResampledSat;
-			ResampleColors(SrcSatellite, SrcW, SrcH, ResampledSat, LandscapeVerts, LandscapeVerts);
+			ResampleColors(SrcSatellite, SrcW, SrcH, ResampledSat, SatTexSize, SatTexSize);
+			SrcSatellite.Empty();
 			const FString AssetName = FString::Printf(TEXT("T_MapboxSat_C%d_%d_Z%d"),
 				Chunk.ChunkX, Chunk.ChunkY, ResolvedZoom);
-			SatTexture = SaveTransientToAsset(ResampledSat, LandscapeVerts, LandscapeVerts, AssetName);
+			SatTexture = SaveTransientToAsset(ResampledSat, SatTexSize, SatTexSize, AssetName);
+		}
+		else
+		{
+			SrcSatellite.Empty();
 		}
 
 		const double WorldSizePerLandscapeCm = SrcW * WorldCmPerSourcePixel;
-		ALandscape* Landscape = SpawnLandscapeForChunk(
+		ALandscapeProxy* Landscape = SpawnLandscapeForChunk(
 			Chunk, Heightmap, LayerWeights, SatTexture,
 			(double)LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale,
 			TileWorldCm, TotalWorldX, TotalWorldY);
@@ -1439,10 +1784,37 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			FMapboxTileResult R; R.TileGridX = Chunk.ChunkX; R.TileGridY = Chunk.ChunkY; R.Landscape = Landscape;
 			GeneratedLandscapes.Add(R);
 
-			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, LandscapeVerts, WorldSizePerLandscapeCm);
+			// PCG + HISM scatter share the heightmap so they don't need physics traces.
+			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, Heightmap,
+				LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale);
 			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizePerLandscapeCm);
+
+			// World Partition convert: split this chunk's landscape into spatially-loaded streaming proxies.
+			// This is the same operation as the editor menu Build > World Partition > Convert Landscape, just
+			// called inline so the user doesn't have to do it manually. After this returns, the original
+			// ALandscape stays as a lightweight parent (components moved out), and N ALandscapeStreamingProxy
+			// actors hold the actual terrain — each spatially-loaded, so WP unloads distant ones based on
+			// editor/PIE camera distance. Massive resident-memory drop for large fetches.
+			//
+			// Only runs in WP worlds; FLandscapeConfigHelper requires UActorPartitionSubsystem which only
+			// exists in WP. Outside WP we leave the chunk as a standalone ALandscape (works fine, no streaming).
+			PartitionChunkLandscape(Landscape);
+		}
+
+		// Release everything before the next iteration. Empty() returns the backing buffer to the allocator
+		// (Reset() would keep it for reuse — wrong here, we want peak memory to drop).
+		Heightmap.Empty();
+		LayerWeights.Empty();
+
+		// Periodic GC to collect transient UTexture2D/UMIC/ULandscapeLayerInfoObject objects from this chunk.
+		if (((ChunkIdx + 1) & 3) == 0)
+		{
+			CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/false);
 		}
 	}
+
+	// Final GC to clean up the last batch of transient objects.
+	CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/false);
 
 	UE_LOG(LogMapbox, Log, TEXT("Mapbox: created %d landscape actor(s)."), GeneratedLandscapes.Num());
 	if (GeneratedLandscapes.Num() > 0)
@@ -1460,7 +1832,7 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 	FinishFetch();
 }
 
-ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
+ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
 	const TArray<uint16>& HeightData,
 	const TMap<FName, TArray<uint8>>& LayerWeights,
 	UTexture2D* SatelliteTexture,
@@ -1479,13 +1851,27 @@ ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk&
 	const int32 Verts = (int32)LandscapeVertsPerSide;
 	const int32 ComponentsPerSide = (Verts - 1) / SectionSize;
 
+	// Per-chunk standalone ALandscape. Tried shared LandscapeGuid + ALandscapeStreamingProxy children for a
+	// parent/proxy hierarchy — but UE5.7 packs up to 8 LandscapeComponents per heightmap texture
+	// (LandscapeEdit.cpp:3231) and FLandscapeGroup::RegisterComponent asserts on shared heightmaps in the
+	// same world (LandscapeGroup.cpp:135). That assert is bypassed for non-ALandscapeStreamingProxy actors
+	// via the early-out at LandscapeGroup.cpp:95. So we keep each chunk as its own ALandscape (unique GUID,
+	// its own ULandscapeInfo) and just mark it spatially-loaded — World Partition still streams each chunk
+	// independently by camera distance, which is the actual win the user asked for.
 	FActorSpawnParameters Params;
 	Params.Name = MakeUniqueObjectName(World->PersistentLevel, ALandscape::StaticClass(),
 		*FString::Printf(TEXT("MapboxLandscape_C%d_%d"), Chunk.ChunkX, Chunk.ChunkY));
 	ALandscape* Landscape = World->SpawnActor<ALandscape>(ALandscape::StaticClass(), Params);
 	if (!Landscape) return nullptr;
-
 	Landscape->SetActorLabel(FString::Printf(TEXT("MapboxLandscape_C%d_%d"), Chunk.ChunkX, Chunk.ChunkY));
+	// NOTE: ALandscape::CanChangeIsSpatiallyLoadedFlag() returns false in UE5.7 (Landscape.h:324), so
+	// ALandscape actors CANNOT be marked spatially loaded directly — calling SetIsSpatiallyLoaded asserts.
+	// In 5.7, landscape streaming exclusively goes through ALandscapeStreamingProxy actors, and the only
+	// supported path to produce those is ALandscape::SplitHeightmap, which expects one big landscape already
+	// imported. Importing per-chunk directly into streaming proxies hits a heightmap-sharing assert in
+	// FLandscapeGroup::RegisterComponent. So instead the spawn keeps each chunk as a standalone ALandscape
+	// (always-loaded by default), and the user runs Build > World Partition > Convert Landscape after the
+	// fetch finishes — that command does the SplitHeightmap conversion properly and yields streaming proxies.
 
 	// Position chunk by its actual tile offset (handles uneven trailing chunks correctly)
 	// and center the whole area on the actor's pivot.
@@ -1577,27 +1963,21 @@ ALandscape* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk&
 
 // ----- PCG / HISM scatter ---------------------------------------------------
 
-static FVector SampleLandscapeHeight(ALandscape* Landscape, double WorldX, double WorldY)
+// Sample world Z (cm) directly from the heightmap. This bypasses the landscape collision system,
+// which avoids paying tens of millions of LineTraceSingleByChannel calls when scattering grass etc.
+// Format: Heightmap[i] in [0..65535], 32768 = baseline. World Z = Origin.Z + (val - 32768) * (ZScale / 128).
+static FORCEINLINE double HeightmapWorldZ(const TArray<uint16>& Heightmap, int32 LandscapeVerts,
+	int32 vx, int32 vy, double LandscapeZScale, double OriginZ)
 {
-	if (!Landscape) return FVector(WorldX, WorldY, 0.0);
-	const FVector Origin = Landscape->GetActorLocation();
-	const FVector Scale = Landscape->GetActorScale3D();
-	// Approximation: use the landscape's collision component height query via line trace.
-	UWorld* World = Landscape->GetWorld();
-	if (!World) return FVector(WorldX, WorldY, Origin.Z);
-	FHitResult Hit;
-	const FVector Start(WorldX, WorldY, Origin.Z + 100000.f);
-	const FVector End(WorldX, WorldY, Origin.Z - 100000.f);
-	FCollisionQueryParams P;
-	if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, P))
-	{
-		return Hit.ImpactPoint;
-	}
-	return FVector(WorldX, WorldY, Origin.Z);
+	const int32 cx = FMath::Clamp(vx, 0, LandscapeVerts - 1);
+	const int32 cy = FMath::Clamp(vy, 0, LandscapeVerts - 1);
+	const int32 H = (int32)Heightmap[cy * LandscapeVerts + cx];
+	return OriginZ + (double)(H - 32768) * LandscapeZScale / 128.0;
 }
 
-void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscape* Landscape, UTexture2D* /*SatelliteTexture*/,
-	const TMap<FName, TArray<uint8>>& LayerWeights, int32 LandscapeVerts, double WorldSizePerLandscapeCm)
+void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTexture2D* /*SatelliteTexture*/,
+	const TMap<FName, TArray<uint8>>& LayerWeights, const TArray<uint16>& Heightmap,
+	int32 LandscapeVerts, double WorldSizePerLandscapeCm, double LandscapeZScale)
 {
 	if (!Landscape) return;
 
@@ -1613,14 +1993,16 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscape* Landscape, UTexture
 			PCG->RegisterComponent();
 			PCG->SetGraph(Graph);
 			PCG->GenerationTrigger = EPCGComponentGenerationTrigger::GenerateOnLoad;
-			PCG->Generate(true);
-			// Continue and also do HISM as a baseline; user can disable HISM by emptying meshes once their PCG graph is wired up.
+			// Async generation. Synchronous Generate(true) was stalling the editor across many landscapes.
+			PCG->Generate(false);
 		}
 	}
 
-	// HISM scatter — respects per-layer weight maps so trees only land on forest, etc.
+	// HISM scatter: respects per-layer weight maps so trees only land on forest etc.
+	// Uses the heightmap directly (no line traces) and a meters-based stride floor.
 	const FVector LandscapeOrigin = Landscape->GetActorLocation();
 	const double CmPerVert = WorldSizePerLandscapeCm / FMath::Max(1, LandscapeVerts - 1);
+	const double MetersPerVert = CmPerVert / 100.0;
 
 	for (const FMapboxLayerDef& L : MapboxLayers)
 	{
@@ -1629,7 +2011,24 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscape* Landscape, UTexture
 		if (!WeightsPtr || WeightsPtr->IsEmpty()) continue;
 		const TArray<uint8>& Weights = *WeightsPtr;
 
-		// One HISM component per unique mesh in the layer's array.
+		// Stride from min spacing: at least the configured spacing in meters, never below 1 vertex.
+		// Old formula floor(10/Density) gave stride=1 for grass-like densities and triggered ~1M sample
+		// attempts per landscape. With a 3m minimum, grass at zoom 15 (CmPerVert ~297cm) gets stride=1
+		// (3m / ~3m), at zoom 16 stride=2 etc. — bounded behavior.
+		const double SpacingMeters = FMath::Max((double)L.ScatterMinSpacingMeters, 10.0 / FMath::Max(0.01f, L.ScatterDensity));
+		const int32 SampleStride = FMath::Max(1, FMath::CeilToInt(SpacingMeters / FMath::Max(MetersPerVert, 0.01)));
+
+		// Quick pre-filter: if no sample at this stride has weight, skip the whole layer for this landscape.
+		bool bAnyHits = false;
+		for (int32 vy = 0; vy < LandscapeVerts && !bAnyHits; vy += SampleStride)
+		for (int32 vx = 0; vx < LandscapeVerts && !bAnyHits; vx += SampleStride)
+		{
+			if (Weights[vy * LandscapeVerts + vx] >= 128) bAnyHits = true;
+		}
+		if (!bAnyHits) continue;
+
+		// Create HISMs only after the pre-filter passes — saves stranded component objects on landscapes
+		// where this layer has zero coverage.
 		TMap<UStaticMesh*, UHierarchicalInstancedStaticMeshComponent*> HISMs;
 		for (const TSoftObjectPtr<UStaticMesh>& MeshRef : L.ScatterMeshes)
 		{
@@ -1653,33 +2052,83 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscape* Landscape, UTexture
 		TArray<UStaticMesh*> MeshOptions;
 		HISMs.GetKeys(MeshOptions);
 
-		// One sample per N landscape verts, where N ~ 100 / density (lower density = wider spacing).
-		const float Density = FMath::Max(0.01f, L.ScatterDensity);
-		const int32 SampleStride = FMath::Max(1, (int32)FMath::FloorToInt(10.f / Density));
 		FRandomStream Rng((int32)(GetTypeHash(L.LayerName) ^ GetTypeHash((void*)Landscape)));
+		const int32 MaxInstances = FMath::Max(100, L.ScatterMaxInstancesPerLandscape);
+		int32 PlacedCount = 0;
 
-		for (int32 vy = 0; vy < LandscapeVerts; vy += SampleStride)
+		for (int32 vy = 0; vy < LandscapeVerts && PlacedCount < MaxInstances; vy += SampleStride)
 		{
-			for (int32 vx = 0; vx < LandscapeVerts; vx += SampleStride)
+			for (int32 vx = 0; vx < LandscapeVerts && PlacedCount < MaxInstances; vx += SampleStride)
 			{
 				const uint8 W = Weights[vy * LandscapeVerts + vx];
 				if (W < 128) continue; // require majority weight
+
 				const double Jx = (vx + Rng.FRandRange(-0.4, 0.4)) * CmPerVert;
 				const double Jy = (vy + Rng.FRandRange(-0.4, 0.4)) * CmPerVert;
 				const double WorldX = LandscapeOrigin.X + Jx;
 				const double WorldY = LandscapeOrigin.Y + Jy;
-				const FVector Pos = SampleLandscapeHeight(Landscape, WorldX, WorldY);
+				const double WorldZ = HeightmapWorldZ(Heightmap, LandscapeVerts, vx, vy, LandscapeZScale, LandscapeOrigin.Z);
+
 				const float ScaleS = Rng.FRandRange(L.ScatterMinScale, L.ScatterMaxScale);
 				const float Yaw = L.bRandomYaw ? Rng.FRandRange(0.f, 360.f) : 0.f;
 				UStaticMesh* Pick = MeshOptions[Rng.RandRange(0, MeshOptions.Num() - 1)];
-				FTransform T(FRotator(0.f, Yaw, 0.f), Pos, FVector(ScaleS));
+				FTransform T(FRotator(0.f, Yaw, 0.f), FVector(WorldX, WorldY, WorldZ), FVector(ScaleS));
 				HISMs[Pick]->AddInstance(T, true);
+				++PlacedCount;
 			}
+		}
+
+		if (PlacedCount >= MaxInstances)
+		{
+			UE_LOG(LogMapbox, Warning, TEXT("Mapbox: scatter capped at %d instances for layer '%s' on landscape '%s' (raise ScatterMaxInstancesPerLandscape if you need more)."),
+				MaxInstances, *L.LayerName.ToString(), *Landscape->GetActorLabel());
 		}
 	}
 }
 
-void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscape* Landscape, UTexture2D* SatelliteTexture, double WorldSizePerLandscapeCm)
+void UMapboxImporterConfig::PartitionChunkLandscape(ALandscapeProxy* Landscape)
+{
+#if WITH_EDITOR
+	if (!IsValid(Landscape))
+	{
+		return;
+	}
+
+	UWorld* World = Landscape->GetWorld();
+	if (!World || !World->GetWorldPartition())
+	{
+		// Not a WP world — keep as standalone. The user was already informed via the soft pre-flight notice.
+		return;
+	}
+
+	ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
+	if (!LandscapeInfo || !LandscapeInfo->LandscapeActor.IsValid())
+	{
+		UE_LOG(LogMapbox, Warning, TEXT("Mapbox: skipping WP partition for %s — no LandscapeInfo or no parent landscape actor."),
+			*Landscape->GetActorLabel());
+		return;
+	}
+
+	// Grid size = components-per-WP-cell. Matches UE5's default for new Open World landscapes (8). With our
+	// default 4 tiles/side and 4 components/tile = 16x16 components/chunk, this splits each chunk into 4
+	// (2x2) streaming proxies. Smaller cells = finer streaming granularity but more proxy actors; 8 hits a
+	// reasonable balance.
+	constexpr uint32 GridSizeInComponents = 8;
+
+	const FString LandscapeLabel = Landscape->GetActorLabel();
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: partitioning '%s' into WP streaming proxies (grid=%u components/cell)…"),
+		*LandscapeLabel, GridSizeInComponents);
+
+	const bool bSuccess = FLandscapeConfigHelper::PartitionLandscape(World, LandscapeInfo, GridSizeInComponents);
+	if (!bSuccess)
+	{
+		UE_LOG(LogMapbox, Warning, TEXT("Mapbox: PartitionLandscape returned false for '%s'. Chunk left as standalone ALandscape (no streaming)."),
+			*LandscapeLabel);
+	}
+#endif
+}
+
+void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture, double WorldSizePerLandscapeCm)
 {
 	if (SatelliteMode != EMapboxSatelliteMode::OverlayDecal) return;
 	if (!Landscape || !SatelliteTexture) return;
@@ -1728,7 +2177,11 @@ void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscape* Landscape, UTexture2
 void UMapboxImporterConfig::FinishFetch()
 {
 	bIsFetching = false;
+	bCancelRequested = false;
 	InFlightRequests = 0;
+	CompletedBlobCount = 0;
+	LastReportedProgressBlobs = 0;
+	FailedHeightBlobs = 0;
 	PendingDownloadQueue.Reset();
 	CompletedBlobs.Reset();
 }

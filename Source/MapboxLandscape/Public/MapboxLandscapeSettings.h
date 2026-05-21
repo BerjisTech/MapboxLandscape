@@ -72,8 +72,8 @@ public:
 	UPROPERTY(EditAnywhere, config, Category = "Defaults|PCG")
 	TSoftObjectPtr<UPCGGraphInterface> DefaultScatterPCGGraph;
 
-	UPROPERTY(EditAnywhere, config, Category = "Defaults|PCG")
-	bool bDefaultSpawnPCGComponents = true;
+	UPROPERTY(EditAnywhere, config, Category = "Defaults|PCG", meta = (ToolTip = "Default for whether to attach a UPCGComponent to each spawned landscape. Defaults to OFF because synchronous PCG generation across many landscapes stalls the editor; the built-in HISM scatter still runs as a baseline."))
+	bool bDefaultSpawnPCGComponents = false;
 
 	// --- Layer rules ---
 	UPROPERTY(EditAnywhere, config, Category = "Defaults|Layers", meta = (ToolTip = "Default layer classification + scatter rules. New actors copy this on placement; existing actors keep their per-instance overrides."))

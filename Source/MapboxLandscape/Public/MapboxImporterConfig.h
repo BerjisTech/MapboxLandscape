@@ -9,6 +9,7 @@
 
 class UPCGGraphInterface;
 class ALandscape;
+class ALandscapeProxy;
 class UTexture2D;
 class UWorld;
 
@@ -32,7 +33,7 @@ struct FMapboxTileResult
 	int32 TileGridY = 0;
 
 	UPROPERTY(VisibleAnywhere, Category = "Tile")
-	TObjectPtr<ALandscape> Landscape = nullptr;
+	TObjectPtr<ALandscapeProxy> Landscape = nullptr;
 };
 
 /**
@@ -84,7 +85,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (ToolTip = "If on, the plugin picks the best Mapbox zoom level for your area automatically (higher zoom = more detail, more tiles). Turn off to force a specific zoom via the Zoom Level field below."))
 	bool bAutoZoom = true;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (EditCondition = "!bAutoZoom", ClampMin = "8", ClampMax = "18", ToolTip = "Mapbox web-mercator zoom level (the 'z' in z/x/y tile URLs). 10 ~ city region (~10km per tile). 12 ~ neighborhood (~2km per tile). 14 ~ street level (~600m per tile) - good default. 16 ~ building level (~150m per tile). 18 ~ maximum detail (~40m per tile). Each step up = 4x more tiles to fetch."))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (EditCondition = "!bAutoZoom", ClampMin = "8", ClampMax = "15", ToolTip = "Mapbox web-mercator zoom level (the 'z' in z/x/y tile URLs). 10 ~ city region (~10km per tile). 12 ~ neighborhood (~2km per tile). 14 ~ street level (~600m per tile) - good default. 15 ~ block level (~300m per tile). Capped at 15 because that's the highest zoom Mapbox's terrain-RGB tiles serve - going higher would produce a flat landscape because all height tiles would return 404."))
 	int32 ZoomLevel = 14;
 
 	UPROPERTY(EditAnywhere, Category = "Mapbox|Tiling", meta = (ClampMin = "1", ClampMax = "16", ToolTip = "How many Mapbox tiles get baked into ONE ALandscape actor (NxN). 1 = each tile becomes its own landscape (lots of small landscapes, most flexible). 4 = each landscape holds 16 tiles (4x4) - good default. 8+ = fewer, larger landscapes (faster to traverse, more memory per actor)."))
@@ -104,6 +105,9 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Mapbox|Elevation", meta = (ToolTip = "If on, the lowest sampled point in the import becomes world Z=0 and everything else is relative to it. Useful when the imported area is far above sea level (e.g. Nairobi at ~1800m) and you don't want the whole map floating high. If off, real altitudes are used (the surface sits at its actual world Z elevation)."))
 	bool bRebaseToSeaLevel = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|Elevation", meta = (ClampMin = "0", ClampMax = "2", ToolTip = "Fetch height tiles at zoom+N above the satellite/style zoom for sharper terrain detail and smoother cliff edges. +1 quadruples height-tile count but produces ~2x denser elevation samples per landscape vertex (good for sharp escarpments / small areas). +2 is 16x more height tiles - only use for small areas <5km. 0 (default) keeps height at the same zoom and is the right choice for medium-to-large fetches."))
+	int32 HeightZoomBonus = 0;
 
 	UPROPERTY(EditAnywhere, Category = "Mapbox|Satellite", meta = (ToolTip = "How to apply the Mapbox satellite imagery. None = no satellite (you'll author the material yourself). Blend Into Material = bake the satellite texture into a per-landscape material instance, applied directly. Cheapest, best for distant views. Overlay Decal = spawn a decal actor that projects the satellite imagery onto the terrain from above. Lets you keep a separate base material and still see roads/buildings from satellite."))
 	EMapboxSatelliteMode SatelliteMode = EMapboxSatelliteMode::BlendIntoMaterial;
@@ -134,6 +138,9 @@ public:
 
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Destroys every landscape actor created by the most recent Fetch. Other landscapes in your level are left alone."))
 	void ClearGeneratedLandscapes();
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Cancels a running fetch. In-flight HTTP requests can't be recalled, but no more landscapes will be processed after the current tile finishes. Use this when you accidentally requested too large an area."))
+	void CancelFetch();
 
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Restores the default layer set (Forest / Grass / Urban / Road / Water) with sensible color matches. Your custom mesh assignments are wiped."))
 	void ResetLayersToDefaults();
@@ -188,29 +195,41 @@ private:
 	int32 ClassifyPixel(const FColor& Pixel) const;
 
 	UTexture2D* SaveTransientToAsset(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& AssetName) const;
+
+	/** Returns the current editor level's short name (e.g. "Kisumu_Map"). Falls back to "Default"
+	 *  when no level is loaded or the level is unsaved. Used to segregate per-fetch assets by level. */
+	FString GetLevelSubfolder() const;
 	UMaterialInterface* GetOrGenerateMasterMaterial();
 	class UMaterialInstanceConstant* CreateMaterialInstanceForChunk(UMaterialInterface* Master, UTexture2D* SatelliteTexture,
 		int32 ChunkX, int32 ChunkY, FVector LandscapeOriginCm, double LandscapeWorldSizeCm) const;
 	UPCGGraphInterface* GetOrGenerateScatterGraph();
 
-	ALandscape* SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
-	                                   const TArray<uint16>& HeightData,
-	                                   const TMap<FName, TArray<uint8>>& LayerWeights,
-	                                   UTexture2D* SatelliteTexture,
-	                                   double LandscapeVertsPerSide,
-	                                   double WorldSizePerLandscapeCm,
-	                                   double LandscapeZScale,
-	                                   double TileWorldCm,
-	                                   double TotalWorldX,
-	                                   double TotalWorldY);
+	ALandscapeProxy* SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
+	                                        const TArray<uint16>& HeightData,
+	                                        const TMap<FName, TArray<uint8>>& LayerWeights,
+	                                        UTexture2D* SatelliteTexture,
+	                                        double LandscapeVertsPerSide,
+	                                        double WorldSizePerLandscapeCm,
+	                                        double LandscapeZScale,
+	                                        double TileWorldCm,
+	                                        double TotalWorldX,
+	                                        double TotalWorldY);
 
-	void SpawnPCGForLandscape(ALandscape* Landscape, UTexture2D* SatelliteTexture,
+	void SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
 	                          const TMap<FName, TArray<uint8>>& LayerWeights,
+	                          const TArray<uint16>& Heightmap,
 	                          int32 LandscapeVerts,
-	                          double WorldSizePerLandscapeCm);
+	                          double WorldSizePerLandscapeCm,
+	                          double LandscapeZScale);
 
-	void SpawnSatelliteDecal(ALandscape* Landscape, UTexture2D* SatelliteTexture,
+	void SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
 	                         double WorldSizePerLandscapeCm);
+
+	/** Per-chunk World Partition conversion. If the current world is WP, splits this chunk's freshly-imported
+	 *  ALandscape into spatially-loaded ALandscapeStreamingProxy actors organized by WP grid cells (same operation
+	 *  as Build > World Partition > Convert Landscape). After this, WP unloads distant proxies, which is what
+	 *  makes large-area fetches viable on machines with limited RAM. No-op outside WP. */
+	void PartitionChunkLandscape(ALandscapeProxy* Landscape);
 
 	void EnsureDefaultLayers();
 	void FinishFetch();
@@ -220,6 +239,9 @@ private:
 	TArray<FLandscapeChunk> Chunks;
 	int32 InFlightRequests = 0;
 	int32 TotalExpectedBlobs = 0;
+	int32 CompletedBlobCount = 0;       // for download progress logging/toasting
+	int32 LastReportedProgressBlobs = 0; // last value at which we emitted a progress toast
+	int32 FailedHeightBlobs = 0;        // count of height tiles that returned an error or empty body
 	int32 ResolvedZoom = 14;
 
 	int32 MinTileX = 0;
@@ -228,4 +250,5 @@ private:
 	int32 MaxTileY = 0;
 
 	bool bIsFetching = false;
+	bool bCancelRequested = false;
 };

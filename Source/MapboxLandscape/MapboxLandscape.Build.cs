@@ -29,6 +29,7 @@ public class MapboxLandscape : ModuleRules
 			"JsonUtilities",
 			"Landscape",
 			"LandscapeEditor",
+			"WorldPartitionEditor",
 			"EditorFramework",
 			"UnrealEd",
 			"AssetTools",

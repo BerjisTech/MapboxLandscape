@@ -168,7 +168,10 @@ namespace MapboxMvt
 			{
 				if (Current.Num() > 0)
 				{
-					Current.Add(Current[0]);
+					// Copy by value first — Current[0] is a reference into the same array we're growing,
+					// and Add() may reallocate which would dangle the reference. UE5 TArray asserts on this.
+					const FVector2D First = Current[0];
+					Current.Add(First);
 				}
 			}
 		}

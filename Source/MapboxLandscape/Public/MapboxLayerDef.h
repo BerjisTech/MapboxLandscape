@@ -109,6 +109,12 @@ struct FMapboxLayerDef
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (EditCondition = "bScatterEnabled", ClampMin = "0.0", ToolTip = "Average meshes per 100 square meters. 4 = ~1 tree per 25m^2 (sparse forest). 12 = dense grass. 0.5 = scattered landmarks."))
 	float ScatterDensity = 5.0f;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (EditCondition = "bScatterEnabled", ClampMin = "0.5", ToolTip = "Minimum world-space spacing between scatter instances, meters. Floor on stride so dense layers (grass) don't spawn millions of instances when landscape resolution is high. 3m = grass density, 8m = trees."))
+	float ScatterMinSpacingMeters = 3.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (EditCondition = "bScatterEnabled", ClampMin = "100", ClampMax = "1000000", ToolTip = "Hard cap on instances spawned per layer per landscape. Safety belt: if ScatterDensity + tile size would produce more, the scatter loop bails after this many. Tune up if you want denser foliage and have GPU headroom."))
+	int32 ScatterMaxInstancesPerLandscape = 50000;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (EditCondition = "bScatterEnabled", ClampMin = "0.0", ToolTip = "Each instance is randomly scaled in [Min, Max]. 0.8/1.3 = mild natural variation."))
 	float ScatterMinScale = 0.8f;
 

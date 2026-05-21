@@ -8,6 +8,7 @@
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionDivide.h"
+#include "Materials/MaterialExpressionLandscapeLayerWeight.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
@@ -118,6 +119,9 @@ namespace MapboxAssetGenerator
 		Material->SetShadingModel(MSM_DefaultLit);
 		Material->TwoSided = false;
 		Material->bUsedWithStaticLighting = true;
+		// Masked so the "Clear" landscape weight layer can cut holes in the surface (carved hills / hidden sections).
+		Material->BlendMode = BLEND_Masked;
+		Material->OpacityMaskClipValue = 0.5f;
 
 		auto AddExpr = [Material](UClass* ExprClass) -> UMaterialExpression*
 		{
@@ -198,10 +202,37 @@ namespace MapboxAssetGenerator
 		Roughness->MaterialExpressionEditorX = -250;
 		Roughness->MaterialExpressionEditorY = 240;
 
+		// "Clear" landscape layer drives opacity. Weight 1.0 -> opacity 0 -> pixel discarded (cut a hole / carve hill).
+		// Weight 0.0 -> opacity 1 -> pixel renders normally. Routed via LandscapeLayerWeight expression so the
+		// landscape system feeds the per-pixel layer alpha directly.
+		UMaterialExpressionLandscapeLayerWeight* ClearWeight = Cast<UMaterialExpressionLandscapeLayerWeight>(
+			AddExpr(UMaterialExpressionLandscapeLayerWeight::StaticClass()));
+		ClearWeight->ParameterName = TEXT("Clear");
+		ClearWeight->PreviewWeight = 0.f;
+		ClearWeight->MaterialExpressionEditorX = -500;
+		ClearWeight->MaterialExpressionEditorY = 400;
+
+		// Constant 1.0 fed into ConstBase so the unweighted ("Clear==0") output is 1.0.
+		UMaterialExpressionConstant* OneConst = Cast<UMaterialExpressionConstant>(
+			AddExpr(UMaterialExpressionConstant::StaticClass()));
+		OneConst->R = 1.0f;
+		OneConst->MaterialExpressionEditorX = -700;
+		OneConst->MaterialExpressionEditorY = 460;
+		ClearWeight->Base.Expression = OneConst;
+
+		// Constant 0.0 fed into Layer input so the weighted ("Clear==1") output is 0.0.
+		UMaterialExpressionConstant* ZeroConst = Cast<UMaterialExpressionConstant>(
+			AddExpr(UMaterialExpressionConstant::StaticClass()));
+		ZeroConst->R = 0.0f;
+		ZeroConst->MaterialExpressionEditorX = -700;
+		ZeroConst->MaterialExpressionEditorY = 540;
+		ClearWeight->Layer.Expression = ZeroConst;
+
 #if WITH_EDITORONLY_DATA
 		auto& EditorOnly = *Material->GetEditorOnlyData();
 		EditorOnly.BaseColor.Expression = SatTex;
 		EditorOnly.Roughness.Expression = Roughness;
+		EditorOnly.OpacityMask.Expression = ClearWeight;
 #endif
 
 		Material->PreEditChange(nullptr);
