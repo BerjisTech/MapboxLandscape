@@ -2619,13 +2619,19 @@ void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landsca
 	}
 
 	// Hide the editor control-point sprites. With thousands of CPs across a fetch the default sprite
-	// icons (a small mountain texture) tile-fill the viewport and make the editor unusable. Users who
-	// want to edit splines can still select control points via wireframe + box select; the sprites
-	// aren't load-bearing.
+	// icons (a small mountain texture) tile-fill the viewport and make the editor unusable.
+	//
+	// Setting ControlPointSprite to nullptr is NOT safe — FLandscapeSplinesSceneProxy dereferences it
+	// without a null check (LandscapeSplines.cpp:333), causing an EXCEPTION_ACCESS_VIOLATION when the
+	// editor next tries to render the splines. Instead toggle bShowSplineEditorMesh, which the proxy
+	// reads into bDrawControlPointSprite at construction (LandscapeSplines.cpp:185) and guards every
+	// sprite draw call with (LandscapeSplines.cpp:298). This also hides the falloff dashed lines.
+	// Users who want the sprites back can untick bHideSplineEditorSprites and re-populate, or set
+	// bShowSplineEditorMesh = true on the spline component directly.
 #if WITH_EDITORONLY_DATA
 	if (bHideSplineEditorSprites)
 	{
-		SplinesComp->ControlPointSprite = nullptr;
+		SplinesComp->bShowSplineEditorMesh = false;
 	}
 #endif
 
