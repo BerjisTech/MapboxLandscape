@@ -4,6 +4,7 @@
 #include "MapboxLandscapeSettings.h"
 #include "MapboxMvtReader.h"
 
+#include "AssetCompilingManager.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "Components/DecalComponent.h"
@@ -651,17 +652,17 @@ void UMapboxImporterConfig::FetchLandscape()
 		return;
 	}
 
-	// Pre-flight memory budget. Aborts before we start downloads if the working set would crowd out the OS.
-	// Better to refuse politely than to bring the editor down. We model two pools:
-	//   • Transient: in-flight tile blobs, one chunk's scratch buffers, satellite textures saved as assets.
-	//   • Steady-state: each spawned ALandscape holds its own LandscapeComponent UObjects + heightmap/weightmap
-	//     UTexture2Ds that the engine packs and KEEPS RESIDENT (you can't GC them — they're owned by the actor).
-	//     Empirically ~70 MB per landscape at default settings (16x16 components × ~1 MB packed heightmap/weightmap
-	//     pair each, plus component data). This is the real reason large fetches blow up: 169 landscapes ≈ 12 GB
-	//     resident, dwarfing the 80 MB-per-chunk transient peak.
+	// Pre-flight memory budget. Two cases:
+	//   WP world: each chunk gets partitioned into streaming proxies immediately, and WP unloads distant proxies
+	//     from camera. Resident memory doesn't scale linearly with chunk count — only the "loading range"
+	//     subset stays in RAM. Budget the per-chunk peak plus a modest WP loaded-set ceiling.
+	//   Non-WP world: every chunk stays an always-loaded ALandscape forever. Budget includes the full sum.
 	{
 		const FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
 		const double AvailableMB = (double)MemStats.AvailablePhysical / (1024.0 * 1024.0);
+		UWorld* PreflightWorldForBudget = GetWorld();
+		const bool bIsWP = (PreflightWorldForBudget != nullptr) && (PreflightWorldForBudget->GetWorldPartition() != nullptr);
+
 		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 		const int32 KindsPerTile = 2
 			+ (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0)
@@ -676,26 +677,45 @@ void UMapboxImporterConfig::FetchLandscape()
 		const double SatTexMB = (SatelliteMode != EMapboxSatelliteMode::None)
 			? LandscapeCount * 1.5 : 0.0;                             // BC7 512² cooked, kept loaded after save
 
-		// --- STEADY-STATE: the heavy hitter. Each ALandscape keeps its components + packed h/w textures resident. ---
 		const double PerLandscapeResidentMB = 70.0;                   // measured at default 16×16 component grid
-		const double LandscapeResidentMB = LandscapeCount * PerLandscapeResidentMB;
+
+		// --- RESIDENT MODEL ---
+		// WP: lightweight parents always loaded + WP-loaded subset of proxies (we conservatively assume the
+		// loading range covers a 5×5 cells = 25-proxy hot set). With grid size 8 components/cell, our default
+		// 16×16-component chunks produce ~4 proxies each, so the parent count == landscape count.
+		// Non-WP: every chunk is a heavyweight always-loaded ALandscape.
+		const double ParentLightweightMB = 5.0;                       // ALandscape with components moved out
+		const double WPLoadedSetMB = 25.0 * PerLandscapeResidentMB;   // ~25 streaming proxies × ~70 MB each
+		const double LandscapeResidentMB = bIsWP
+			? (LandscapeCount * ParentLightweightMB + WPLoadedSetMB)
+			: (LandscapeCount * PerLandscapeResidentMB);
 
 		const double EstPeakMB = TilesMB + PeakChunkScratchMB + SatTexMB + LandscapeResidentMB;
 
-		UE_LOG(LogMapbox, Log, TEXT("Mapbox: pre-flight peak=%.0f MB (tiles=%.0f, 1 chunk=%.0f, sat=%.0f, %d landscapes resident=%.0f), %d HTTP requests, vs available=%.0f MB"),
-			EstPeakMB, TilesMB, PeakChunkScratchMB, SatTexMB, LandscapeCount, LandscapeResidentMB, TotalRequests, AvailableMB);
+		UE_LOG(LogMapbox, Log, TEXT("Mapbox: pre-flight peak=%.0f MB [%s] (tiles=%.0f, 1 chunk=%.0f, sat=%.0f, landscape-resident=%.0f), %d HTTP requests, vs available=%.0f MB"),
+			EstPeakMB, bIsWP ? TEXT("WP streaming") : TEXT("standalone"),
+			TilesMB, PeakChunkScratchMB, SatTexMB, LandscapeResidentMB, TotalRequests, AvailableMB);
 
 		if (EstPeakMB > AvailableMB * 0.7)
 		{
+			const FString DetailWP = FString::Printf(TEXT(
+				"Even with WP streaming, the fetch needs to import each chunk into memory once (peak ~%.0f MB/chunk) "
+				"and WP keeps ~25 nearby proxies loaded (~%.0f MB) plus the per-chunk parent actors (~%.0f MB). "
+				"Reduce Radius Km, raise Tiles Per Landscape Side (currently %d), or close other apps. "
+				"You can also fetch sub-regions separately and save the level between fetches — WP unloads cleanly across saves."),
+				PeakChunkScratchMB, WPLoadedSetMB, LandscapeCount * ParentLightweightMB, TilesPerLandscapeSide);
+			const FString DetailStandalone = FString::Printf(TEXT(
+				"Non-WP level: every chunk stays resident as a full ALandscape (~%.0f MB each), so %d landscapes = %.0f MB permanent. "
+				"Either:\n"
+				"  • Convert this level to Open World (Build > World Partition > Convert Level) so the plugin can stream chunks\n"
+				"  • Reduce Radius Km until the resident sum fits\n"
+				"  • Raise Tiles Per Landscape Side (currently %d) for fewer, larger landscapes"),
+				PerLandscapeResidentMB, LandscapeCount, LandscapeResidentMB, TilesPerLandscapeSide);
+
 			MapboxUI::Notify(MapboxUI::ESeverity::Error,
-				FString::Printf(TEXT("Mapbox: estimated ~%.0f MB needed (%.0f MB just to keep %d landscapes resident); only ~%.0f MB free."),
-					EstPeakMB, LandscapeResidentMB, LandscapeCount, AvailableMB),
-				FString::Printf(TEXT("Each standalone ALandscape resident cost is ~%.0f MB. Streaming proxies would fix this but UE5.7's per-chunk import path can't produce them directly (engine constraint). Workarounds:\n"
-				                     "  • Reduce Radius Km until LandscapeCount × 70 MB fits in available RAM\n"
-				                     "  • Raise Tiles Per Landscape Side (currently %d) — fewer, larger landscapes\n"
-				                     "  • Close other apps to free RAM\n"
-				                     "  • Fetch sub-regions separately and convert each via Build > World Partition > Convert Landscape, freeing the previous before importing the next"),
-					PerLandscapeResidentMB, TilesPerLandscapeSide),
+				FString::Printf(TEXT("Mapbox: estimated ~%.0f MB needed for this fetch; only ~%.0f MB free."),
+					EstPeakMB, AvailableMB),
+				bIsWP ? DetailWP : DetailStandalone,
 				/*bModal=*/true);
 			FinishFetch();
 			return;
@@ -707,8 +727,9 @@ void UMapboxImporterConfig::FetchLandscape()
 			MapboxUI::Notify(MapboxUI::ESeverity::Warning,
 				FString::Printf(TEXT("Mapbox: this fetch will use ~%.0f MB of ~%.0f MB free."),
 					EstPeakMB, AvailableMB),
-				FString::Printf(TEXT("%d landscapes × ~%.0f MB resident = %.0f MB that won't free until you delete them. Expect the OS to issue a memory-pressure toast as we approach the limit; you can cancel mid-fetch if it gets dicey."),
-					LandscapeCount, PerLandscapeResidentMB, LandscapeResidentMB));
+				bIsWP
+					? TEXT("WP streaming is on, so this stays bounded after fetch — but during fetch all chunks land before WP gets a chance to unload them. Close heavy apps if you're tight on RAM. You can cancel mid-fetch.")
+					: TEXT("Non-WP level: every chunk stays resident permanently. Cancel mid-fetch if memory pressure shows up."));
 		}
 
 		// Soft cap on total HTTP requests. Anything > 5000 will spend tens of minutes against Mapbox's rate limit,
@@ -1788,17 +1809,6 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, Heightmap,
 				LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale);
 			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizePerLandscapeCm);
-
-			// World Partition convert: split this chunk's landscape into spatially-loaded streaming proxies.
-			// This is the same operation as the editor menu Build > World Partition > Convert Landscape, just
-			// called inline so the user doesn't have to do it manually. After this returns, the original
-			// ALandscape stays as a lightweight parent (components moved out), and N ALandscapeStreamingProxy
-			// actors hold the actual terrain — each spatially-loaded, so WP unloads distant ones based on
-			// editor/PIE camera distance. Massive resident-memory drop for large fetches.
-			//
-			// Only runs in WP worlds; FLandscapeConfigHelper requires UActorPartitionSubsystem which only
-			// exists in WP. Outside WP we leave the chunk as a standalone ALandscape (works fine, no streaming).
-			PartitionChunkLandscape(Landscape);
 		}
 
 		// Release everything before the next iteration. Empty() returns the backing buffer to the allocator
@@ -1829,6 +1839,19 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			TEXT("Check the Output Log for per-tile errors (often HTTP 401 = invalid token, or 404 = wrong style ID)."),
 			/*bModal=*/true);
 	}
+
+	// Phase: convert standalone ALandscapes to WP streaming proxies in one batch.
+	// Doing this per-chunk during the loop above was a disaster: each PartitionLandscape triggers ~256
+	// SplitHeightmap calls (one per LandscapeComponent), each creating a new UTexture2D and queuing a BC7
+	// texture compile. Interleaving that with the chunk import loop both serialized partition work behind
+	// the texture compile queue AND let the queue grow unbounded, triggering OS memory pressure during
+	// the final "preparing textures" phase. Batching at end is no faster overall but bounds queue depth
+	// via FinishAllCompilation between batches.
+	if (bConvertToWorldPartitionStreaming && GeneratedLandscapes.Num() > 0)
+	{
+		ConvertGeneratedLandscapesToStreaming();
+	}
+
 	FinishFetch();
 }
 
@@ -2086,7 +2109,7 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 	}
 }
 
-void UMapboxImporterConfig::PartitionChunkLandscape(ALandscapeProxy* Landscape)
+void UMapboxImporterConfig::PartitionSingleLandscape(ALandscapeProxy* Landscape)
 {
 #if WITH_EDITOR
 	if (!IsValid(Landscape))
@@ -2097,7 +2120,6 @@ void UMapboxImporterConfig::PartitionChunkLandscape(ALandscapeProxy* Landscape)
 	UWorld* World = Landscape->GetWorld();
 	if (!World || !World->GetWorldPartition())
 	{
-		// Not a WP world — keep as standalone. The user was already informed via the soft pre-flight notice.
 		return;
 	}
 
@@ -2109,22 +2131,105 @@ void UMapboxImporterConfig::PartitionChunkLandscape(ALandscapeProxy* Landscape)
 		return;
 	}
 
-	// Grid size = components-per-WP-cell. Matches UE5's default for new Open World landscapes (8). With our
-	// default 4 tiles/side and 4 components/tile = 16x16 components/chunk, this splits each chunk into 4
-	// (2x2) streaming proxies. Smaller cells = finer streaming granularity but more proxy actors; 8 hits a
-	// reasonable balance.
-	constexpr uint32 GridSizeInComponents = 8;
-
-	const FString LandscapeLabel = Landscape->GetActorLabel();
-	UE_LOG(LogMapbox, Log, TEXT("Mapbox: partitioning '%s' into WP streaming proxies (grid=%u components/cell)…"),
-		*LandscapeLabel, GridSizeInComponents);
-
-	const bool bSuccess = FLandscapeConfigHelper::PartitionLandscape(World, LandscapeInfo, GridSizeInComponents);
+	const uint32 GridSize = (uint32)FMath::Clamp(WorldPartitionGridSizeInComponents, 1, 32);
+	const bool bSuccess = FLandscapeConfigHelper::PartitionLandscape(World, LandscapeInfo, GridSize);
 	if (!bSuccess)
 	{
 		UE_LOG(LogMapbox, Warning, TEXT("Mapbox: PartitionLandscape returned false for '%s'. Chunk left as standalone ALandscape (no streaming)."),
-			*LandscapeLabel);
+			*Landscape->GetActorLabel());
 	}
+#endif
+}
+
+void UMapboxImporterConfig::ConvertGeneratedLandscapesToStreaming()
+{
+#if WITH_EDITOR
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error, TEXT("Mapbox: no editor world."), TEXT("Open a level first."));
+		return;
+	}
+	if (!World->GetWorldPartition())
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox: this level is not World Partition."),
+			TEXT("Streaming conversion needs WP. Either convert the level (Build > World Partition > Convert Level) or skip this step."),
+			/*bModal=*/true);
+		return;
+	}
+
+	// Collect target landscapes: prefer in-memory GeneratedLandscapes, fall back to scanning the world for
+	// any actor whose label/name starts with "MapboxLandscape_" so we still work after editor restarts
+	// (the config is transient and forgets refs between sessions).
+	TArray<ALandscapeProxy*> Targets;
+	for (const FMapboxTileResult& T : GeneratedLandscapes)
+	{
+		if (IsValid(T.Landscape))
+		{
+			Targets.Add(T.Landscape);
+		}
+	}
+	if (Targets.IsEmpty())
+	{
+		for (TActorIterator<ALandscape> It(World); It; ++It)
+		{
+			ALandscape* L = *It;
+			if (!IsValid(L)) continue;
+			if (L->GetActorLabel().StartsWith(TEXT("MapboxLandscape_")) || L->GetName().StartsWith(TEXT("MapboxLandscape_")))
+			{
+				Targets.Add(L);
+			}
+		}
+	}
+
+	if (Targets.IsEmpty())
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			TEXT("Mapbox: no Mapbox-generated landscapes found to convert."),
+			TEXT("Either fetch first, or rename target landscapes to start with 'MapboxLandscape_'."));
+		return;
+	}
+
+	const int32 BatchSize = FMath::Max(1, PartitionBatchSize);
+	const int32 TotalCount = Targets.Num();
+	const int32 NumBatches = FMath::DivideAndRoundUp(TotalCount, BatchSize);
+
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: converting %d landscape(s) to WP streaming proxies in %d batch(es) of %d, grid=%d components/cell…"),
+		TotalCount, NumBatches, BatchSize, WorldPartitionGridSizeInComponents);
+
+	FScopedSlowTask SlowTask((float)TotalCount, FText::FromString(FString::Printf(
+		TEXT("Mapbox: converting %d landscape(s) to World Partition streaming proxies…"), TotalCount)));
+	SlowTask.MakeDialog(/*bShowCancelButton=*/false);
+
+	int32 ConvertedOk = 0;
+	for (int32 BatchStart = 0; BatchStart < TotalCount; BatchStart += BatchSize)
+	{
+		const int32 BatchEnd = FMath::Min(BatchStart + BatchSize, TotalCount);
+		for (int32 i = BatchStart; i < BatchEnd; ++i)
+		{
+			ALandscapeProxy* Target = Targets[i];
+			if (!IsValid(Target)) continue;
+
+			const FString Label = Target->GetActorLabel();
+			SlowTask.EnterProgressFrame(1.0f, FText::FromString(FString::Printf(
+				TEXT("Partitioning %d/%d: %s"), i + 1, TotalCount, *Label)));
+
+			PartitionSingleLandscape(Target);
+			++ConvertedOk;
+		}
+
+		// Drain the texture compile queue before starting the next batch. Each PartitionLandscape triggers
+		// ~256 SplitHeightmap calls and each one queues a BC7 compile; without this drain the queue grows
+		// unbounded across the whole conversion and triggers OS memory pressure at the very end.
+		FAssetCompilingManager::Get().FinishAllCompilation();
+
+		// GC after each batch to release transient old-heightmap UTexture2Ds that SplitHeightmap orphaned.
+		CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/false);
+	}
+
+	MapboxUI::Notify(MapboxUI::ESeverity::Success,
+		FString::Printf(TEXT("Mapbox: converted %d landscape(s) to WP streaming."), ConvertedOk));
 #endif
 }
 

@@ -130,6 +130,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Mapbox|PCG", meta = (ToolTip = "If on, a UPCGComponent is added to each landscape that runs the ScatterPCGGraph above. Independent of the HISM fallback scatter - both can run."))
 	bool bSpawnPCGComponents = true;
 
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ToolTip = "If on AND the current level is World Partition, automatically convert imported chunks into spatially-loaded streaming proxies at the end of fetch (same op as Build > World Partition > Convert Landscape, just chained). WP then unloads distant proxies for low resident memory. Costs significant fetch time because each component gets its heightmap split into a per-component texture. Turn off if you want a fast fetch and will run the manual Convert Generated Landscapes To Streaming action later (or don't need streaming)."))
+	bool bConvertToWorldPartitionStreaming = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ClampMin = "1", ClampMax = "32", EditCondition = "bConvertToWorldPartitionStreaming", ToolTip = "Components per WP grid cell during conversion. Smaller = finer streaming granularity (more proxies, more spawn cost, smaller load/unload steps). Larger = coarser streaming (fewer proxies, faster conversion, larger units). 16 matches our default per-chunk component count so each chunk becomes 1 proxy."))
+	int32 WorldPartitionGridSizeInComponents = 16;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ClampMin = "1", ClampMax = "64", EditCondition = "bConvertToWorldPartitionStreaming", ToolTip = "How many landscapes to partition before flushing the texture compile queue. Smaller = lower peak memory during conversion, slower overall. Larger = faster, but the BC7 compile queue can pile up and trigger OS memory pressure near the end. 8 keeps the queue bounded on a 32 GB / 14 GB-free system."))
+	int32 PartitionBatchSize = 8;
+
 	UPROPERTY(VisibleAnywhere, Category = "Mapbox|Status", meta = (ToolTip = "References to the ALandscape actors created by the most recent Fetch. Read-only - use Clear Generated Landscapes to remove them."))
 	TArray<FMapboxTileResult> GeneratedLandscapes;
 
@@ -153,6 +162,9 @@ public:
 
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Copies the current Project Settings > Plugins > Mapbox Landscape defaults (zoom, layers, material, etc.) into this importer, overwriting your in-panel edits."))
 	void ResetFromProjectSettings();
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Manually convert all Mapbox-generated landscapes in the level to World Partition streaming proxies. Equivalent to the auto-conversion at end of fetch, but you can run it any time — useful if you turned off Convert To World Partition Streaming on the original fetch, or want to re-convert after editing. Requires a World Partition level."))
+	void ConvertGeneratedLandscapesToStreaming();
 
 	static FString GetApiKey();
 
@@ -225,11 +237,9 @@ private:
 	void SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
 	                         double WorldSizePerLandscapeCm);
 
-	/** Per-chunk World Partition conversion. If the current world is WP, splits this chunk's freshly-imported
-	 *  ALandscape into spatially-loaded ALandscapeStreamingProxy actors organized by WP grid cells (same operation
-	 *  as Build > World Partition > Convert Landscape). After this, WP unloads distant proxies, which is what
-	 *  makes large-area fetches viable on machines with limited RAM. No-op outside WP. */
-	void PartitionChunkLandscape(ALandscapeProxy* Landscape);
+	/** Internal: partition a single ALandscape into WP streaming proxies. Called by the public batch action;
+	 *  not for direct use because it doesn't drain the texture compile queue. No-op outside a WP world. */
+	void PartitionSingleLandscape(ALandscapeProxy* Landscape);
 
 	void EnsureDefaultLayers();
 	void FinishFetch();
