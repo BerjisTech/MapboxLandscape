@@ -8,6 +8,7 @@ Practical operating notes for the plugin. Read these before complaining about lo
 - [Speed knobs & tradeoffs](speed-knobs.md) — the settings that move the needle, what to turn off when, with examples
 - [Memory sizing & radius limits](memory-sizing.md) — how big a fetch your machine can take, WP vs non-WP, real numbers
 - [World Partition streaming](world-partition.md) — what conversion does, when to skip it, manual re-run
+- [World features](world-features.md) — roads/paths/railways as landscape splines (Blosm-style), Brushify road-dust recipe
 - [Layer system](layers.md) — the 20-layer default set, how classification picks winners, the special Clear layer
 - [Troubleshooting](troubleshooting.md) — flat landscapes, assertion crashes, missing textures, things that look broken
 - [Workflow recipes](workflows.md) — "I want to do X" → concrete settings and steps
@@ -24,3 +25,4 @@ Practical operating notes for the plugin. Read these before complaining about lo
 | Smoother cliffs/slopes | Increase `HeightZoomBonus` to 1 (small areas only — 4× height requests) |
 | More streaming granularity | Reduce `WorldPartitionGridSizeInComponents` (default 16 → 8 = 4× as many proxies) |
 | Cancel a running fetch | Click `Cancel Fetch` in the importer panel |
+| Generate roads + paths + rails from OSM | Tick `Generate Road Splines`, click `Reset Road Classes To Defaults`, assign meshes, fetch. See [world-features.md](world-features.md) |

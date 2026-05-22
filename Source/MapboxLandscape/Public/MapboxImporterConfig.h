@@ -130,6 +130,12 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Mapbox|PCG", meta = (ToolTip = "If on, a UPCGComponent is added to each landscape that runs the ScatterPCGGraph above. Independent of the HISM fallback scatter - both can run."))
 	bool bSpawnPCGComponents = true;
 
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Roads", meta = (ToolTip = "If on, the plugin extracts road/path/railway polylines from the Mapbox vector tiles and generates ULandscapeSplineSegments on each landscape's spline component — same system as Epic's built-in landscape spline tools. Each enabled RoadClass below maps OSM road classes to a spline mesh and a landscape paint layer (e.g. Sand for Brushify-style dust shoulders)."))
+	bool bGenerateRoadSplines = false;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Roads", meta = (EditCondition = "bGenerateRoadSplines", ToolTip = "Per-OSM-road-class mesh and paint settings. Order doesn't matter — each road feature is matched against every entry's class list. Use 'Reset Road Classes To Defaults' to populate a sensible starting set covering motorway, primary, secondary, tertiary, residential, path, and rail."))
+	TArray<FMapboxRoadClassSettings> RoadClasses;
+
 	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ToolTip = "If on AND the current level is World Partition, automatically convert imported chunks into spatially-loaded streaming proxies at the end of fetch (same op as Build > World Partition > Convert Landscape, just chained). WP then unloads distant proxies for low resident memory. Costs significant fetch time because each component gets its heightmap split into a per-component texture. Turn off if you want a fast fetch and will run the manual Convert Generated Landscapes To Streaming action later (or don't need streaming)."))
 	bool bConvertToWorldPartitionStreaming = true;
 
@@ -165,6 +171,9 @@ public:
 
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Manually convert all Mapbox-generated landscapes in the level to World Partition streaming proxies. Equivalent to the auto-conversion at end of fetch, but you can run it any time — useful if you turned off Convert To World Partition Streaming on the original fetch, or want to re-convert after editing. Requires a World Partition level."))
 	void ConvertGeneratedLandscapesToStreaming();
+
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Populate Road Classes with a sensible default set: motorway, primary, secondary, tertiary, residential, path, rail. Your custom mesh + layer assignments are wiped — only the OSM-class-to-row mapping is reset."))
+	void ResetRoadClassesToDefaults();
 
 	static FString GetApiKey();
 
@@ -240,6 +249,26 @@ private:
 	/** Internal: partition a single ALandscape into WP streaming proxies. Called by the public batch action;
 	 *  not for direct use because it doesn't drain the texture compile queue. No-op outside a WP world. */
 	void PartitionSingleLandscape(ALandscapeProxy* Landscape);
+
+	/** One polyline collected from the MVT parse pass, ready for spline generation. Coords are in
+	 *  landscape-pixel space (i.e. [0, LandscapeVerts]) so they share the same coordinate system as the
+	 *  Heightmap array — saves us re-transforming during the vector-parse loop. */
+	struct FCollectedRoadPolyline
+	{
+		int32 RoadClassIndex = INDEX_NONE;
+		TArray<FVector2D> LandscapePixels;
+	};
+
+	/** Build ULandscapeSplineControlPoint + ULandscapeSplineSegment objects on the landscape's spline
+	 *  component, one per collected polyline. Samples Z from Heightmap per control point so roads
+	 *  drape correctly. No-op if Roads is empty or RoadClasses is empty. */
+	void GenerateRoadSplinesForChunk(ALandscapeProxy* Landscape,
+	                                 const TArray<FCollectedRoadPolyline>& Roads,
+	                                 const TArray<uint16>& Heightmap,
+	                                 int32 LandscapeVerts,
+	                                 double WorldSizePerLandscapeCm,
+	                                 double LandscapeZScale,
+	                                 const FVector& ChunkOrigin);
 
 	void EnsureDefaultLayers();
 	void FinishFetch();

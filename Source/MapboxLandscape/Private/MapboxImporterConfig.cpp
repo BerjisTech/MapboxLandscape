@@ -32,6 +32,9 @@
 #include "LandscapeInfo.h"
 #include "LandscapeLayerInfoObject.h"
 #include "LandscapeProxy.h"
+#include "LandscapeSplineControlPoint.h"
+#include "LandscapeSplineSegment.h"
+#include "LandscapeSplinesComponent.h"
 #include "LandscapeStreamingProxy.h"
 #include "WorldPartition/WorldPartition.h"
 #include "Materials/MaterialInstanceConstant.h"
@@ -183,6 +186,39 @@ void UMapboxImporterConfig::EnsureDefaultLayers()
 	{
 		MapboxLayers = Settings->DefaultLayers;
 	}
+}
+
+void UMapboxImporterConfig::ResetRoadClassesToDefaults()
+{
+	auto MakeClass = [](FName ClassName, std::initializer_list<const TCHAR*> Matches,
+		float Width, float PaintWidth, FName PaintLayer)
+	{
+		FMapboxRoadClassSettings R;
+		R.ClassName = ClassName;
+		R.bEnabled = true;
+		R.MvtLayer = TEXT("road");
+		for (const TCHAR* M : Matches) { R.MvtClassMatches.Add(FString(M)); }
+		R.SplineWidthMeters = Width;
+		R.PaintWidthMeters = PaintWidth;
+		R.PaintLayer = PaintLayer;
+		R.RaiseAboveTerrainCm = 5.0f;
+		R.ControlPointSpacingMeters = 20.0f;
+		return R;
+	};
+
+	RoadClasses.Empty();
+	// Width / paint values calibrated against typical Brushify road meshes and OSM-real road widths.
+	RoadClasses.Add(MakeClass(TEXT("Motorway"),    { TEXT("motorway") },                       18.f, 24.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(TEXT("Primary"),     { TEXT("primary"), TEXT("trunk") },         12.f, 16.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(TEXT("Secondary"),   { TEXT("secondary") },                       9.f, 12.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(TEXT("Tertiary"),    { TEXT("tertiary") },                        7.f, 10.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(TEXT("Residential"), { TEXT("residential"), TEXT("service") },    6.f,  8.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(TEXT("Path"),        { TEXT("path"), TEXT("pedestrian"), TEXT("track"), TEXT("footway") }, 2.f, 3.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(TEXT("Railway"),     { TEXT("major_rail"), TEXT("minor_rail") },  4.f,  6.f, NAME_None));
+
+#if WITH_EDITOR
+	PostEditChange();
+#endif
 }
 
 void UMapboxImporterConfig::ResetLayersToDefaults()
@@ -518,7 +554,7 @@ void UMapboxImporterConfig::EnumerateTiles(double N, double S, double E, double 
 		}
 	}
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -663,7 +699,7 @@ void UMapboxImporterConfig::FetchLandscape()
 		UWorld* PreflightWorldForBudget = GetWorld();
 		const bool bIsWP = (PreflightWorldForBudget != nullptr) && (PreflightWorldForBudget->GetWorldPartition() != nullptr);
 
-		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
 		const int32 KindsPerTile = 2
 			+ (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0)
 			+ (bNeedVector ? 1 : 0);
@@ -779,7 +815,7 @@ void UMapboxImporterConfig::StartNextDownloads()
 		return;
 	}
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -1360,7 +1396,7 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
 	const int32 HZScale = 1 << HZB;
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -1514,6 +1550,11 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		const double MetersPerSrcPixel = TileSideMeters / 256.0;
 		const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
 
+		// Collect road polylines during the vector-parse loop below; consumed after SpawnLandscapeForChunk.
+		// Coords go in here in landscape-pixel space so they share a coord system with the heightmap.
+		TArray<FCollectedRoadPolyline> CollectedRoads;
+		const bool bWantRoads = bGenerateRoadSplines && !RoadClasses.IsEmpty();
+
 		// Allocate per-active-layer vector masks at LANDSCAPE resolution (not source).
 		VectorMasksAtLandscapeRes.SetNum(MapboxLayers.Num());
 		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
@@ -1599,6 +1640,44 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 						const double LandscapeBaseX = tx * LandscapePxPerSatTile;
 						const double LandscapeBaseY = ty * LandscapePxPerSatTile;
 						const double LandscapeMetersPerPixel = (TileSideMeters * Chunk.TilesX) / FMath::Max(1, LandscapeVerts);
+
+						// Road extraction: iterate MVT layers/features once more for road generation. Cheap because
+						// vector features are already parsed; we just walk the FFeature array against RoadClasses.
+						if (bWantRoads)
+						{
+							for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+							{
+								for (int32 RoadIdx = 0; RoadIdx < RoadClasses.Num(); ++RoadIdx)
+								{
+									const FMapboxRoadClassSettings& RC = RoadClasses[RoadIdx];
+									if (!RC.bEnabled) continue;
+									if (!RC.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
+
+									const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
+
+									for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+									{
+										if (Feature.Type != MapboxMvt::EFeatureType::LineString) continue;
+										if (!MapboxMvt::FeatureMatchesClass(Feature, RC.MvtClassMatches)) continue;
+
+										for (const TArray<FVector2D>& Line : Feature.Geometry)
+										{
+											if (Line.Num() < 2) continue;
+											FCollectedRoadPolyline Poly;
+											Poly.RoadClassIndex = RoadIdx;
+											Poly.LandscapePixels.Reserve(Line.Num());
+											for (const FVector2D& P : Line)
+											{
+												Poly.LandscapePixels.Add(FVector2D(
+													LandscapeBaseX + P.X * ExtentToLandscape,
+													LandscapeBaseY + P.Y * ExtentToLandscape));
+											}
+											CollectedRoads.Add(MoveTemp(Poly));
+										}
+									}
+								}
+							}
+						}
 
 						for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
 						{
@@ -1809,6 +1888,16 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, Heightmap,
 				LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale);
 			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizePerLandscapeCm);
+
+			// World Features — roads, paths, railways. Polylines collected during the vector-parse loop above
+			// are dropped onto the landscape's ULandscapeSplinesComponent as Epic-style spline segments with
+			// per-class mesh + paint-layer assignment.
+			if (bWantRoads && !CollectedRoads.IsEmpty())
+			{
+				const FVector ChunkOrigin = Landscape->GetActorLocation();
+				GenerateRoadSplinesForChunk(Landscape, CollectedRoads, Heightmap,
+					LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale, ChunkOrigin);
+			}
 		}
 
 		// Release everything before the next iteration. Empty() returns the backing buffer to the allocator
@@ -2107,6 +2196,168 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 				MaxInstances, *L.LayerName.ToString(), *Landscape->GetActorLabel());
 		}
 	}
+}
+
+void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landscape,
+	const TArray<FCollectedRoadPolyline>& Roads,
+	const TArray<uint16>& Heightmap,
+	int32 LandscapeVerts,
+	double WorldSizePerLandscapeCm,
+	double LandscapeZScale,
+	const FVector& ChunkOrigin)
+{
+#if WITH_EDITOR
+	if (!IsValid(Landscape) || Roads.IsEmpty() || RoadClasses.IsEmpty())
+	{
+		return;
+	}
+
+	// Ensure the landscape has a spline component to populate.
+	ULandscapeSplinesComponent* SplinesComp = Landscape->GetSplinesComponent();
+	if (!SplinesComp)
+	{
+		Landscape->CreateSplineComponent();
+		SplinesComp = Landscape->GetSplinesComponent();
+	}
+	if (!SplinesComp)
+	{
+		UE_LOG(LogMapbox, Warning, TEXT("Mapbox: failed to create spline component on '%s'; skipping road generation."),
+			*Landscape->GetActorLabel());
+		return;
+	}
+
+	SplinesComp->Modify();
+
+	// Coord conversions:
+	//   landscape-pixel space → local landscape-space (units = landscape grid quads, Z = heightmap value)
+	//   Local Z encoding: Heightmap[i] in [0, 65535], 32768 = baseline. Local Z is in the same
+	//   "quads" coord system the spline component uses (no XYScale applied because the actor transform
+	//   scales it during render). Reference: ULandscapeSplineControlPoint::Location comment ("in
+	//   Landscape-space"). The landscape's XYScale = WorldSizePerLandscapeCm / (Verts-1) maps local
+	//   space to world; control point Z works in scaled-quad units, matching component RelativeLocation.
+	const double LocalUnitsPerLandscapePixel = (double)(LandscapeVerts - 1) / FMath::Max(1.0, (double)LandscapeVerts);
+	auto HeightmapZ = [&Heightmap, LandscapeVerts](int32 vx, int32 vy)
+	{
+		const int32 cx = FMath::Clamp(vx, 0, LandscapeVerts - 1);
+		const int32 cy = FMath::Clamp(vy, 0, LandscapeVerts - 1);
+		// Local-Z = heightmap value re-centered. Z = (val - 32768) * (ZScale/128) gives world cm, but
+		// we want LOCAL units which is world / LandscapeZScale = (val - 32768) / 128. The actor's
+		// ZScale handles the conversion at render time.
+		const int32 H = (int32)Heightmap[cy * LandscapeVerts + cx];
+		return (double)(H - 32768) / 128.0;
+	};
+
+	// XY scale used to convert spline widths from meters to local-quad units. One landscape quad =
+	// (WorldSizePerLandscapeCm / (Verts-1)) cm in world. So meters_to_local = meters * 100 / cm_per_quad.
+	const double CmPerLocalQuad = WorldSizePerLandscapeCm / FMath::Max(1.0, (double)(LandscapeVerts - 1));
+	const double MetersToLocalQuads = 100.0 / FMath::Max(CmPerLocalQuad, 1.0);
+
+	TArray<TObjectPtr<ULandscapeSplineControlPoint>>& AllCPs = SplinesComp->GetControlPoints();
+	TArray<TObjectPtr<ULandscapeSplineSegment>>& AllSegments = SplinesComp->GetSegments();
+
+	int32 TotalControlPoints = 0;
+	int32 TotalSegments = 0;
+
+	for (const FCollectedRoadPolyline& Road : Roads)
+	{
+		if (!RoadClasses.IsValidIndex(Road.RoadClassIndex)) continue;
+		const FMapboxRoadClassSettings& Class = RoadClasses[Road.RoadClassIndex];
+		if (!Class.bEnabled || Road.LandscapePixels.Num() < 2) continue;
+
+		// Resample the polyline by ControlPointSpacingMeters so we don't produce one CP per source vertex
+		// (MVT polylines can be very dense). Cubic-Hermite handles the in-between curvature.
+		const double SpacingLocalQuads = FMath::Max(1.0, (double)Class.ControlPointSpacingMeters * MetersToLocalQuads);
+
+		// Pre-compute cumulative arclength along the polyline so we can sample at uniform spacing.
+		TArray<double> CumLen;
+		CumLen.SetNumZeroed(Road.LandscapePixels.Num());
+		double TotalLen = 0.0;
+		for (int32 i = 1; i < Road.LandscapePixels.Num(); ++i)
+		{
+			TotalLen += FVector2D::Distance(Road.LandscapePixels[i - 1], Road.LandscapePixels[i]);
+			CumLen[i] = TotalLen;
+		}
+		if (TotalLen < 1.0) continue; // collapsed polyline
+
+		const int32 NumSamples = FMath::Max(2, FMath::CeilToInt(TotalLen / SpacingLocalQuads) + 1);
+		TArray<FVector2D> SampledPixels;
+		SampledPixels.Reserve(NumSamples);
+		for (int32 s = 0; s < NumSamples; ++s)
+		{
+			const double Target = (double)s / (NumSamples - 1) * TotalLen;
+			// Binary-ish walk forward through CumLen.
+			int32 Seg = 0;
+			while (Seg + 1 < CumLen.Num() && CumLen[Seg + 1] < Target) { ++Seg; }
+			const double SegLen = (Seg + 1 < CumLen.Num()) ? (CumLen[Seg + 1] - CumLen[Seg]) : 1.0;
+			const double T = (SegLen > 0.0) ? (Target - CumLen[Seg]) / SegLen : 0.0;
+			const FVector2D A = Road.LandscapePixels[Seg];
+			const FVector2D B = Road.LandscapePixels[FMath::Min(Seg + 1, Road.LandscapePixels.Num() - 1)];
+			SampledPixels.Add(FMath::Lerp(A, B, T));
+		}
+
+		// Build a chain of control points + segments. Each CP location is in landscape-local space.
+		TArray<ULandscapeSplineControlPoint*> ChainCPs;
+		ChainCPs.Reserve(SampledPixels.Num());
+		for (int32 s = 0; s < SampledPixels.Num(); ++s)
+		{
+			const FVector2D& P = SampledPixels[s];
+			ULandscapeSplineControlPoint* CP = NewObject<ULandscapeSplineControlPoint>(SplinesComp, NAME_None, RF_Transactional);
+			CP->Location = FVector(
+				P.X * LocalUnitsPerLandscapePixel,
+				P.Y * LocalUnitsPerLandscapePixel,
+				HeightmapZ(FMath::RoundToInt(P.X), FMath::RoundToInt(P.Y)) + Class.RaiseAboveTerrainCm / FMath::Max(LandscapeZScale, 1.0) * 128.0);
+			CP->Width = (Class.SplineWidthMeters * 0.5f) * (float)MetersToLocalQuads;
+			CP->SideFalloff = FMath::Max(1.0f, ((Class.PaintWidthMeters - Class.SplineWidthMeters) * 0.5f) * (float)MetersToLocalQuads);
+			CP->LayerName = Class.PaintLayer;
+			CP->bRaiseTerrain = false;
+			CP->bLowerTerrain = false;
+			AllCPs.Add(CP);
+			ChainCPs.Add(CP);
+			++TotalControlPoints;
+		}
+
+		// Resolve the spline mesh once per class (sync load — fine for editor-only).
+		UStaticMesh* Mesh = Class.SplineMesh.LoadSynchronous();
+
+		// Connect adjacent CPs with segments.
+		for (int32 s = 0; s + 1 < ChainCPs.Num(); ++s)
+		{
+			ULandscapeSplineControlPoint* CPA = ChainCPs[s];
+			ULandscapeSplineControlPoint* CPB = ChainCPs[s + 1];
+
+			ULandscapeSplineSegment* Seg = NewObject<ULandscapeSplineSegment>(SplinesComp, NAME_None, RF_Transactional);
+			Seg->Connections[0].ControlPoint = CPA;
+			Seg->Connections[1].ControlPoint = CPB;
+			Seg->Connections[0].TangentLen = (float)FVector::Distance(CPA->Location, CPB->Location);
+			Seg->Connections[1].TangentLen = Seg->Connections[0].TangentLen;
+			Seg->LayerName = Class.PaintLayer;
+			Seg->bRaiseTerrain = false;
+			Seg->bLowerTerrain = false;
+
+			if (Mesh)
+			{
+				FLandscapeSplineMeshEntry MeshEntry;
+				MeshEntry.Mesh = Mesh;
+				MeshEntry.bCenterH = true;
+				Seg->SplineMeshes.Add(MeshEntry);
+			}
+
+			AllSegments.Add(Seg);
+			CPA->ConnectedSegments.Add(FLandscapeSplineConnection(Seg, 0));
+			CPB->ConnectedSegments.Add(FLandscapeSplineConnection(Seg, 1));
+			++TotalSegments;
+		}
+	}
+
+	// One global rebuild after we've added everything — significantly cheaper than rebuilding per segment.
+	if (TotalSegments > 0)
+	{
+		SplinesComp->RebuildAllSplines(/*bBuildCollision=*/true);
+	}
+
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: %s — added %d road control points / %d segments."),
+		*Landscape->GetActorLabel(), TotalControlPoints, TotalSegments);
+#endif
 }
 
 void UMapboxImporterConfig::PartitionSingleLandscape(ALandscapeProxy* Landscape)

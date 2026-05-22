@@ -127,3 +127,49 @@ struct FMapboxLayerDef
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (EditCondition = "bScatterEnabled", ToolTip = "If on, instance Z is aligned with the landscape surface normal (steep slopes will tilt instances). Off = instances stand vertically regardless of slope."))
 	bool bAlignToLandscapeNormal = false;
 };
+
+/**
+ * Per-road-class visual settings for the World Features generator. Each entry describes one class
+ * of OpenStreetMap road (e.g. motorway, primary, residential, path, rail) and how the plugin should
+ * render it on the landscape: which static mesh to sweep along the spline, which landscape paint
+ * layer to apply for road-shoulder color (e.g. Sand for Brushify-style dust), and how wide to make
+ * the spline mesh + paint deformation.
+ *
+ * Maps to Epic's built-in ULandscapeSplineSegment system — the engine handles mesh tiling and
+ * landscape paint deformation; we just feed it the polyline geometry and the per-segment specs.
+ */
+USTRUCT(BlueprintType)
+struct FMapboxRoadClassSettings
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Display name. Doesn't affect generation — just helps you find this entry in the array."))
+	FName ClassName = TEXT("Residential");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "If off, this class is skipped. Useful for testing one class at a time without deleting the others."))
+	bool bEnabled = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Mapbox Streets v8 layer to read from. 'road' for streets/paths/rails. Default is 'road' and you rarely need anything else."))
+	FString MvtLayer = TEXT("road");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Match features whose 'class' property is one of these. Examples:\n  ['motorway']                    — interstates/freeways\n  ['primary', 'trunk']            — major roads\n  ['secondary', 'tertiary']       — regional\n  ['residential', 'service']      — neighborhood streets\n  ['path', 'pedestrian', 'track'] — footpaths\n  ['major_rail', 'minor_rail']    — railways"))
+	TArray<FString> MvtClassMatches;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Spline mesh swept along the road. Should be aligned so its local +X axis is the forward direction. Compatible with Brushify road kits, Epic's spline road meshes, or any single-axis mesh. Leave empty to skip mesh generation (paint layer still applies)."))
+	TSoftObjectPtr<UStaticMesh> SplineMesh;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "0.5", ToolTip = "Spline mesh width in meters. Should match the visual width of your road mesh — too narrow and it stretches; too wide and it tiles oddly. Defaults: motorway=18, primary=12, residential=7, path=2, rail=4."))
+	float SplineWidthMeters = 7.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Landscape weight layer to paint along this road. e.g. 'Sand' for Brushify-style sandy shoulders, 'Dirt' for a country road look, or NAME_None to leave the underlying landscape paint untouched. The layer must already exist in the MapboxLayers config (i.e., your landscape must have been imported with that layer enabled)."))
+	FName PaintLayer = NAME_None;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "0.5", ToolTip = "Paint deformation width in meters — how wide the landscape paint layer extends from the spline centerline. Usually a bit wider than SplineWidthMeters so the paint overlaps the road shoulder. Set to 0 to disable paint deformation."))
+	float PaintWidthMeters = 10.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "0.0", ToolTip = "Lift the road this many cm above the landscape surface. Helps prevent z-fighting where the road mesh meets the terrain. 5–10 cm is usually enough."))
+	float RaiseAboveTerrainCm = 5.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "1.0", ToolTip = "Distance in meters between spline control points along the road. Smaller = smoother curves but more control points (heavier landscape). 20 m is fine for most roads; 5 m for tight mountain switchbacks."))
+	float ControlPointSpacingMeters = 20.0f;
+};
