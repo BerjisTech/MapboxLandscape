@@ -170,6 +170,6 @@ struct FMapboxRoadClassSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "0.0", ToolTip = "Lift the road this many cm above the landscape surface. Helps prevent z-fighting where the road mesh meets the terrain. 5–10 cm is usually enough."))
 	float RaiseAboveTerrainCm = 5.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "1.0", ToolTip = "Distance in meters between spline control points along the road. Smaller = smoother curves but more control points (heavier landscape). 20 m is fine for most roads; 5 m for tight mountain switchbacks."))
-	float ControlPointSpacingMeters = 20.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "10.0", ToolTip = "If a source polyline segment is longer than this, it gets subdivided into smaller chunks. Otherwise the plugin uses the original MVT vertices directly — Mapbox already simplifies polylines appropriately for the zoom level. Smaller values = more control points + smoother terrain following on long straight stretches; larger values = fewer control points + better editor performance. 100 m hits a reasonable balance; raise to 200 m if your editor lags from spline sprite icons."))
+	float MaxSegmentLengthMeters = 100.0f;
 };

@@ -130,11 +130,14 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Mapbox|PCG", meta = (ToolTip = "If on, a UPCGComponent is added to each landscape that runs the ScatterPCGGraph above. Independent of the HISM fallback scatter - both can run."))
 	bool bSpawnPCGComponents = true;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Roads", meta = (ToolTip = "If on, the plugin extracts road/path/railway polylines from the Mapbox vector tiles and generates ULandscapeSplineSegments on each landscape's spline component — same system as Epic's built-in landscape spline tools. Each enabled RoadClass below maps OSM road classes to a spline mesh and a landscape paint layer (e.g. Sand for Brushify-style dust shoulders)."))
-	bool bGenerateRoadSplines = false;
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features", meta = (ToolTip = "Tick to include road/path/railway splines when you run 'Populate World Features'. Doesn't affect Fetch Landscape — world features are now a separate populate step that runs against existing Mapbox-fetched landscapes."))
+	bool bPopulateRoads = true;
 
-	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Roads", meta = (EditCondition = "bGenerateRoadSplines", ToolTip = "Per-OSM-road-class mesh and paint settings. Order doesn't matter — each road feature is matched against every entry's class list. Use 'Reset Road Classes To Defaults' to populate a sensible starting set covering motorway, primary, secondary, tertiary, residential, path, and rail."))
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features", meta = (EditCondition = "bPopulateRoads", ToolTip = "Per-OSM-road-class mesh and paint settings. Order doesn't matter — each road feature is matched against every entry's class list. Use 'Reset Road Classes To Defaults' to populate a sensible starting set covering motorway, primary, secondary, tertiary, residential, path, and rail."))
 	TArray<FMapboxRoadClassSettings> RoadClasses;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features", meta = (ToolTip = "If on, the editor's small mountain-shaped sprite icons that mark every landscape spline control point get hidden after population. Highly recommended — a city's worth of icons tile-fills the viewport and crushes editor performance. You can still edit splines via Landscape Mode > Spline; the icons aren't needed for selection."))
+	bool bHideSplineEditorSprites = true;
 
 	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ToolTip = "If on AND the current level is World Partition, automatically convert imported chunks into spatially-loaded streaming proxies at the end of fetch (same op as Build > World Partition > Convert Landscape, just chained). WP then unloads distant proxies for low resident memory. Costs significant fetch time because each component gets its heightmap split into a per-component texture. Turn off if you want a fast fetch and will run the manual Convert Generated Landscapes To Streaming action later (or don't need streaming)."))
 	bool bConvertToWorldPartitionStreaming = true;
@@ -175,10 +178,18 @@ public:
 	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Populate Road Classes with a sensible default set: motorway, primary, secondary, tertiary, residential, path, rail. Your custom mesh + layer assignments are wiped — only the OSM-class-to-row mapping is reset."))
 	void ResetRoadClassesToDefaults();
 
+	UFUNCTION(CallInEditor, Category = "Mapbox|Actions", meta = (ToolTip = "Generate world features (roads, eventually buildings/water/vegetation) on top of existing Mapbox-fetched landscapes. Re-uses the current Lat/Lng/Radius/Zoom to know which Mapbox tiles to re-download, then drops the resulting polyline/polygon geometry onto each landscape actor it finds. Only the feature types ticked above are populated. Requires that a Fetch Landscape has already run (the plugin looks for MapboxLandscape_* actors in the level)."))
+	void PopulateWorldFeatures();
+
 	static FString GetApiKey();
 
 	struct FTileCoord { int32 X = 0; int32 Y = 0; int32 Z = 0; };
 	enum class ETileKind : uint8 { Height, Metadata, Satellite, Vector };
+
+	/** Which pipeline the active fetch is running. Set on the actions' entry point; consumed by
+	 *  StartNextDownloads (gates which tile kinds get requested) and OnAllTilesDownloaded (branches
+	 *  to the matching processor). Reset to Landscape in FinishFetch. */
+	enum class EFetchMode : uint8 { Landscape, WorldFeatures };
 
 protected:
 #if WITH_EDITOR
@@ -211,6 +222,7 @@ private:
 	void StartRequest(const FTileCoord& Coord, ETileKind Kind);
 	void OnTileResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, FTileCoord Coord, ETileKind Kind);
 	void OnAllTilesDownloaded();
+	void ProcessWorldFeaturesDownloaded();
 
 	uint16 DecodeHeight(uint8 R, uint8 G, uint8 B) const;
 	int32 ClassifyPixel(const FColor& Pixel) const;
@@ -260,11 +272,11 @@ private:
 	};
 
 	/** Build ULandscapeSplineControlPoint + ULandscapeSplineSegment objects on the landscape's spline
-	 *  component, one per collected polyline. Samples Z from Heightmap per control point so roads
-	 *  drape correctly. No-op if Roads is empty or RoadClasses is empty. */
+	 *  component, one per collected polyline. Samples Z via a world-space line trace against the
+	 *  landscape collision per control point (works during fetch + during post-hoc populate without
+	 *  needing the heightmap in memory). No-op if Roads is empty or RoadClasses is empty. */
 	void GenerateRoadSplinesForChunk(ALandscapeProxy* Landscape,
 	                                 const TArray<FCollectedRoadPolyline>& Roads,
-	                                 const TArray<uint16>& Heightmap,
 	                                 int32 LandscapeVerts,
 	                                 double WorldSizePerLandscapeCm,
 	                                 double LandscapeZScale,
@@ -290,4 +302,5 @@ private:
 
 	bool bIsFetching = false;
 	bool bCancelRequested = false;
+	EFetchMode FetchMode = EFetchMode::Landscape;
 };

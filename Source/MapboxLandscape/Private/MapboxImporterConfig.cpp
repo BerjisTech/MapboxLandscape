@@ -202,7 +202,7 @@ void UMapboxImporterConfig::ResetRoadClassesToDefaults()
 		R.PaintWidthMeters = PaintWidth;
 		R.PaintLayer = PaintLayer;
 		R.RaiseAboveTerrainCm = 5.0f;
-		R.ControlPointSpacingMeters = 20.0f;
+		R.MaxSegmentLengthMeters = 100.0f;
 		return R;
 	};
 
@@ -554,7 +554,7 @@ void UMapboxImporterConfig::EnumerateTiles(double N, double S, double E, double 
 		}
 	}
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -615,6 +615,7 @@ void UMapboxImporterConfig::FetchLandscape()
 	EnsureDefaultLayers();
 	bIsFetching = true;
 	InFlightRequests = 0;
+	FetchMode = EFetchMode::Landscape;
 
 	double N, S, E, W;
 	ResolveBoundingBox(N, S, E, W);
@@ -699,7 +700,7 @@ void UMapboxImporterConfig::FetchLandscape()
 		UWorld* PreflightWorldForBudget = GetWorld();
 		const bool bIsWP = (PreflightWorldForBudget != nullptr) && (PreflightWorldForBudget->GetWorldPartition() != nullptr);
 
-		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
+		const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 		const int32 KindsPerTile = 2
 			+ (SatelliteMode != EMapboxSatelliteMode::None ? 1 : 0)
 			+ (bNeedVector ? 1 : 0);
@@ -786,6 +787,110 @@ void UMapboxImporterConfig::FetchLandscape()
 	StartNextDownloads();
 }
 
+void UMapboxImporterConfig::PopulateWorldFeatures()
+{
+#if WITH_EDITOR
+	if (bIsFetching)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			TEXT("Mapbox: a fetch is already running."),
+			TEXT("Wait for it to finish, then click Populate World Features."));
+		return;
+	}
+	if (GetApiKey().IsEmpty())
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox API key is empty."),
+			TEXT("Open Project Settings > Plugins > Mapbox Landscape and paste your Mapbox access token into 'Api Key'."),
+			/*bModal=*/true);
+		return;
+	}
+
+	// Quick eligibility check: nothing to populate if there are no MapboxLandscape_* actors. The original
+	// fetch creates them; we use the same coords to find which Mapbox tiles to re-fetch.
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error, TEXT("Mapbox: no editor world."), TEXT("Open a level first."));
+		return;
+	}
+	int32 LandscapeCountFound = 0;
+	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	{
+		ALandscapeProxy* L = *It;
+		if (!IsValid(L)) continue;
+		const FString Label = L->GetActorLabel();
+		const FString Name = L->GetName();
+		if (Label.StartsWith(TEXT("MapboxLandscape")) || Name.StartsWith(TEXT("MapboxLandscape")))
+		{
+			++LandscapeCountFound;
+		}
+	}
+	if (LandscapeCountFound == 0)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox: no Mapbox-generated landscapes found in this level."),
+			TEXT("Run 'Fetch Landscape' first. World features populate operates on already-fetched landscapes — it does not create new ones."),
+			/*bModal=*/true);
+		return;
+	}
+
+	// Validate at least one feature type is enabled.
+	if (!bPopulateRoads)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			TEXT("Mapbox: no world feature types are enabled."),
+			TEXT("Tick at least one of: Populate Roads (more types coming)."));
+		return;
+	}
+
+	EnsureDefaultLayers();
+	bIsFetching = true;
+	bCancelRequested = false;
+	InFlightRequests = 0;
+	FetchMode = EFetchMode::WorldFeatures;
+
+	double N, S, E, W;
+	ResolveBoundingBox(N, S, E, W);
+	if (N <= S || E <= W)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox: invalid bounding box."),
+			TEXT("Check your Center Latitude/Longitude/Radius — they should match the original fetch."),
+			/*bModal=*/true);
+		FinishFetch();
+		return;
+	}
+
+	const double DegSide = FMath::Max(N - S, (E - W) * FMath::Cos(FMath::DegreesToRadians((N + S) * 0.5)));
+	ResolvedZoom = bAutoZoom ? PickAutoZoom(DegSide) : FMath::Clamp(ZoomLevel, 8, 15);
+
+	EnumerateTiles(N, S, E, W, ResolvedZoom);
+
+	const int32 TotalTiles = (MaxTileX - MinTileX + 1) * (MaxTileY - MinTileY + 1);
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: populate world features — %d vector tiles, %d existing landscapes, %d chunks expected."),
+		TotalTiles, LandscapeCountFound, Chunks.Num());
+	MapboxUI::Notify(MapboxUI::ESeverity::Info,
+		FString::Printf(TEXT("Mapbox: fetching %d vector tiles for world features…"), TotalTiles),
+		FString::Printf(TEXT("Will populate roads on %d existing landscape(s)."), LandscapeCountFound));
+
+	if (TotalTiles == 0)
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Error,
+			TEXT("Mapbox: no tiles in range."),
+			TEXT("Check that your coordinates match the original fetch."), /*bModal=*/true);
+		FinishFetch();
+		return;
+	}
+
+	CompletedBlobCount = 0;
+	LastReportedProgressBlobs = 0;
+	FailedHeightBlobs = 0;
+
+	StartNextDownloads();
+#endif
+}
+
 void UMapboxImporterConfig::CancelFetch()
 {
 	if (!bIsFetching)
@@ -815,7 +920,7 @@ void UMapboxImporterConfig::StartNextDownloads()
 		return;
 	}
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -828,9 +933,19 @@ void UMapboxImporterConfig::StartNextDownloads()
 	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
 	const int32 HZScale = 1 << HZB; // 1, 2, or 4 — height tiles per satellite-tile side
 
+	const bool bWorldFeaturesMode = (FetchMode == EFetchMode::WorldFeatures);
 	while (InFlightRequests < MaxConcurrentRequests && PendingDownloadQueue.Num() > 0)
 	{
 		FTileCoord Coord = PendingDownloadQueue.Pop(EAllowShrinking::No);
+
+		if (bWorldFeaturesMode)
+		{
+			// World-features populate only needs vector tiles. Skip height/metadata/satellite — those landed
+			// during the original landscape fetch and aren't re-fetched here. Heights for road draping
+			// come from a line trace against the existing landscape collision in GenerateRoadSplinesForChunk.
+			StartRequest(Coord, ETileKind::Vector);
+			continue;
+		}
 
 		// Height: at zoom Z+HZB, each sat tile maps to HZScale^2 sub-tiles.
 		for (int32 dy = 0; dy < HZScale; ++dy)
@@ -1384,6 +1499,14 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		return;
 	}
 
+	// World-features populate uses the same HTTP infrastructure but the post-download flow is completely
+	// different — we don't import landscapes, just decorate the existing ones with splines/meshes.
+	if (FetchMode == EFetchMode::WorldFeatures)
+	{
+		ProcessWorldFeaturesDownloaded();
+		return;
+	}
+
 	if (FailedHeightBlobs > 0)
 	{
 		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
@@ -1396,7 +1519,7 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 	const int32 HZB = FMath::Clamp(HeightZoomBonus, 0, FMath::Max(0, 15 - ResolvedZoom));
 	const int32 HZScale = 1 << HZB;
 
-	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers) || (bGenerateRoadSplines && !RoadClasses.IsEmpty());
+	const bool bNeedVector = LayersNeedVectorTiles(MapboxLayers);
 	const bool bHasColorLayer = [this]() {
 		for (const FMapboxLayerDef& L : MapboxLayers)
 		{
@@ -1550,11 +1673,6 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		const double MetersPerSrcPixel = TileSideMeters / 256.0;
 		const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
 
-		// Collect road polylines during the vector-parse loop below; consumed after SpawnLandscapeForChunk.
-		// Coords go in here in landscape-pixel space so they share a coord system with the heightmap.
-		TArray<FCollectedRoadPolyline> CollectedRoads;
-		const bool bWantRoads = bGenerateRoadSplines && !RoadClasses.IsEmpty();
-
 		// Allocate per-active-layer vector masks at LANDSCAPE resolution (not source).
 		VectorMasksAtLandscapeRes.SetNum(MapboxLayers.Num());
 		for (int32 i = 0; i < MapboxLayers.Num(); ++i)
@@ -1640,44 +1758,6 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 						const double LandscapeBaseX = tx * LandscapePxPerSatTile;
 						const double LandscapeBaseY = ty * LandscapePxPerSatTile;
 						const double LandscapeMetersPerPixel = (TileSideMeters * Chunk.TilesX) / FMath::Max(1, LandscapeVerts);
-
-						// Road extraction: iterate MVT layers/features once more for road generation. Cheap because
-						// vector features are already parsed; we just walk the FFeature array against RoadClasses.
-						if (bWantRoads)
-						{
-							for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
-							{
-								for (int32 RoadIdx = 0; RoadIdx < RoadClasses.Num(); ++RoadIdx)
-								{
-									const FMapboxRoadClassSettings& RC = RoadClasses[RoadIdx];
-									if (!RC.bEnabled) continue;
-									if (!RC.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
-
-									const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
-
-									for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
-									{
-										if (Feature.Type != MapboxMvt::EFeatureType::LineString) continue;
-										if (!MapboxMvt::FeatureMatchesClass(Feature, RC.MvtClassMatches)) continue;
-
-										for (const TArray<FVector2D>& Line : Feature.Geometry)
-										{
-											if (Line.Num() < 2) continue;
-											FCollectedRoadPolyline Poly;
-											Poly.RoadClassIndex = RoadIdx;
-											Poly.LandscapePixels.Reserve(Line.Num());
-											for (const FVector2D& P : Line)
-											{
-												Poly.LandscapePixels.Add(FVector2D(
-													LandscapeBaseX + P.X * ExtentToLandscape,
-													LandscapeBaseY + P.Y * ExtentToLandscape));
-											}
-											CollectedRoads.Add(MoveTemp(Poly));
-										}
-									}
-								}
-							}
-						}
 
 						for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
 						{
@@ -1888,16 +1968,6 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, Heightmap,
 				LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale);
 			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizePerLandscapeCm);
-
-			// World Features — roads, paths, railways. Polylines collected during the vector-parse loop above
-			// are dropped onto the landscape's ULandscapeSplinesComponent as Epic-style spline segments with
-			// per-class mesh + paint-layer assignment.
-			if (bWantRoads && !CollectedRoads.IsEmpty())
-			{
-				const FVector ChunkOrigin = Landscape->GetActorLocation();
-				GenerateRoadSplinesForChunk(Landscape, CollectedRoads, Heightmap,
-					LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale, ChunkOrigin);
-			}
 		}
 
 		// Release everything before the next iteration. Empty() returns the backing buffer to the allocator
@@ -1942,6 +2012,153 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 	}
 
 	FinishFetch();
+}
+
+void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
+{
+#if WITH_EDITOR
+	if (bCancelRequested)
+	{
+		FinishFetch();
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		FinishFetch();
+		return;
+	}
+
+	// Map existing MapboxLandscape_* actors by ChunkX,ChunkY parsed out of their name. The name format is
+	// MapboxLandscape_C{X}_{Y} (set by SpawnLandscapeForChunk); chunk indices in the current Chunks[] need
+	// to match for population to align.
+	TMap<FIntPoint, ALandscapeProxy*> ChunkToActor;
+	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	{
+		ALandscapeProxy* L = *It;
+		if (!IsValid(L)) continue;
+		const FString Name = L->GetName();
+		// Parse "MapboxLandscape_C{X}_{Y}..." or "MapboxLandscape_C{X}_{Y}_UEDPIE_..." etc.
+		const int32 CIdx = Name.Find(TEXT("_C"));
+		if (CIdx == INDEX_NONE) continue;
+		const FString Tail = Name.Mid(CIdx + 2);
+		TArray<FString> Parts;
+		Tail.ParseIntoArray(Parts, TEXT("_"), /*bCullEmpty=*/true);
+		if (Parts.Num() < 2) continue;
+		const int32 CX = FCString::Atoi(*Parts[0]);
+		const int32 CY = FCString::Atoi(*Parts[1]);
+		ChunkToActor.Add(FIntPoint(CX, CY), L);
+	}
+
+	if (ChunkToActor.IsEmpty())
+	{
+		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
+			TEXT("Mapbox: no MapboxLandscape_* actors found by name."),
+			TEXT("If you renamed the actors, rename one back so the populate can target them."));
+		FinishFetch();
+		return;
+	}
+
+	const int32 TilesPerSide = FMath::Max(1, TilesPerLandscapeSide);
+	const double TileSideMeters = 156543.03 * FMath::Cos(FMath::DegreesToRadians(CenterLatitude)) / (1 << ResolvedZoom);
+	const double WorldCmPerTile = TileSideMeters * 100.0;
+	const double WorldSizePerLandscapeCm = WorldCmPerTile * (double)TilesPerSide;
+	const int32 SrcW = TilesPerSide * 256;
+	const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
+	const double LandscapePxPerSatTile = (double)LandscapeVerts / (double)TilesPerSide;
+
+	FScopedSlowTask SlowTask((float)Chunks.Num(), FText::FromString(FString::Printf(
+		TEXT("Mapbox: populating world features across %d chunks…"), Chunks.Num())));
+	SlowTask.MakeDialog(/*bShowCancelButton=*/false);
+
+	int32 ChunksWithRoads = 0;
+	int32 TotalPolylines = 0;
+
+	for (const FLandscapeChunk& Chunk : Chunks)
+	{
+		SlowTask.EnterProgressFrame(1.0f, FText::FromString(FString::Printf(
+			TEXT("Chunk (%d, %d)"), Chunk.ChunkX, Chunk.ChunkY)));
+
+		ALandscapeProxy** FoundActor = ChunkToActor.Find(FIntPoint(Chunk.ChunkX, Chunk.ChunkY));
+		if (!FoundActor || !IsValid(*FoundActor)) continue;
+		ALandscapeProxy* Landscape = *FoundActor;
+
+		TArray<FCollectedRoadPolyline> CollectedRoads;
+
+		// Re-parse vector tiles for this chunk and collect road polylines.
+		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
+		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
+		{
+			const int32 TileX = Chunk.MinTileX + tx;
+			const int32 TileY = Chunk.MinTileY + ty;
+			const FString VKey = KeyFor(TileX, TileY, ETileKind::Vector);
+			FTileBlob* Blob = CompletedBlobs.Find(VKey);
+			if (!Blob || !Blob->bOk) continue;
+
+			TArray<MapboxMvt::FLayer> MvtLayers;
+			if (!MapboxMvt::ParseTile(Blob->Bytes, MvtLayers)) continue;
+
+			const double LandscapeBaseX = tx * LandscapePxPerSatTile;
+			const double LandscapeBaseY = ty * LandscapePxPerSatTile;
+
+			if (bPopulateRoads)
+			{
+				for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+				{
+					for (int32 RoadIdx = 0; RoadIdx < RoadClasses.Num(); ++RoadIdx)
+					{
+						const FMapboxRoadClassSettings& RC = RoadClasses[RoadIdx];
+						if (!RC.bEnabled) continue;
+						if (!RC.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
+
+						const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
+
+						for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+						{
+							if (Feature.Type != MapboxMvt::EFeatureType::LineString) continue;
+							if (!MapboxMvt::FeatureMatchesClass(Feature, RC.MvtClassMatches)) continue;
+
+							for (const TArray<FVector2D>& Line : Feature.Geometry)
+							{
+								if (Line.Num() < 2) continue;
+								FCollectedRoadPolyline Poly;
+								Poly.RoadClassIndex = RoadIdx;
+								Poly.LandscapePixels.Reserve(Line.Num());
+								for (const FVector2D& P : Line)
+								{
+									Poly.LandscapePixels.Add(FVector2D(
+										LandscapeBaseX + P.X * ExtentToLandscape,
+										LandscapeBaseY + P.Y * ExtentToLandscape));
+								}
+								CollectedRoads.Add(MoveTemp(Poly));
+							}
+						}
+					}
+				}
+			}
+
+			CompletedBlobs.Remove(VKey);
+		}
+
+		if (bPopulateRoads && !CollectedRoads.IsEmpty())
+		{
+			// Use the landscape's actual transform — it knows where it is in the world.
+			const FVector ChunkOrigin = Landscape->GetActorLocation();
+			const FVector ActorScale = Landscape->GetActorScale3D();
+			TotalPolylines += CollectedRoads.Num();
+			GenerateRoadSplinesForChunk(Landscape, CollectedRoads, LandscapeVerts,
+				WorldSizePerLandscapeCm, ActorScale.Z, ChunkOrigin);
+			++ChunksWithRoads;
+		}
+	}
+
+	MapboxUI::Notify(MapboxUI::ESeverity::Success,
+		FString::Printf(TEXT("Mapbox: populated %d polyline(s) across %d landscape(s)."),
+			TotalPolylines, ChunksWithRoads));
+
+	FinishFetch();
+#endif
 }
 
 ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
@@ -2200,7 +2417,6 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 
 void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landscape,
 	const TArray<FCollectedRoadPolyline>& Roads,
-	const TArray<uint16>& Heightmap,
 	int32 LandscapeVerts,
 	double WorldSizePerLandscapeCm,
 	double LandscapeZScale,
@@ -2228,29 +2444,32 @@ void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landsca
 
 	SplinesComp->Modify();
 
+	UWorld* World = Landscape->GetWorld();
+
 	// Coord conversions:
-	//   landscape-pixel space → local landscape-space (units = landscape grid quads, Z = heightmap value)
-	//   Local Z encoding: Heightmap[i] in [0, 65535], 32768 = baseline. Local Z is in the same
-	//   "quads" coord system the spline component uses (no XYScale applied because the actor transform
-	//   scales it during render). Reference: ULandscapeSplineControlPoint::Location comment ("in
-	//   Landscape-space"). The landscape's XYScale = WorldSizePerLandscapeCm / (Verts-1) maps local
-	//   space to world; control point Z works in scaled-quad units, matching component RelativeLocation.
+	//   landscape-pixel space → landscape-local space (1 unit = 1 landscape quad in the X/Y plane;
+	//   Z is also in "quad units" — the actor's ZScale multiplies it to get world cm at render time).
 	const double LocalUnitsPerLandscapePixel = (double)(LandscapeVerts - 1) / FMath::Max(1.0, (double)LandscapeVerts);
-	auto HeightmapZ = [&Heightmap, LandscapeVerts](int32 vx, int32 vy)
+	const double CmPerLocalQuad_XY = WorldSizePerLandscapeCm / FMath::Max(1.0, (double)(LandscapeVerts - 1));
+
+	// World-space Z sampler via vertical line trace against the landscape collision. Works both during
+	// fetch (collision is registered post-Import) and post-fetch (collision is already in the level).
+	// Returns world cm; falls back to ChunkOrigin.Z if the trace misses (e.g. tile area outside the
+	// landscape's collision bounds).
+	auto SampleWorldZ = [World, &ChunkOrigin](double WorldX, double WorldY) -> double
 	{
-		const int32 cx = FMath::Clamp(vx, 0, LandscapeVerts - 1);
-		const int32 cy = FMath::Clamp(vy, 0, LandscapeVerts - 1);
-		// Local-Z = heightmap value re-centered. Z = (val - 32768) * (ZScale/128) gives world cm, but
-		// we want LOCAL units which is world / LandscapeZScale = (val - 32768) / 128. The actor's
-		// ZScale handles the conversion at render time.
-		const int32 H = (int32)Heightmap[cy * LandscapeVerts + cx];
-		return (double)(H - 32768) / 128.0;
+		if (!World) return ChunkOrigin.Z;
+		const FVector Start(WorldX, WorldY, ChunkOrigin.Z + 200000.0); // 2 km up
+		const FVector End  (WorldX, WorldY, ChunkOrigin.Z - 200000.0);
+		FHitResult Hit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(MapboxRoadZSample), /*bTraceComplex=*/false);
+		World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, Params);
+		return Hit.bBlockingHit ? Hit.ImpactPoint.Z : ChunkOrigin.Z;
 	};
 
 	// XY scale used to convert spline widths from meters to local-quad units. One landscape quad =
 	// (WorldSizePerLandscapeCm / (Verts-1)) cm in world. So meters_to_local = meters * 100 / cm_per_quad.
-	const double CmPerLocalQuad = WorldSizePerLandscapeCm / FMath::Max(1.0, (double)(LandscapeVerts - 1));
-	const double MetersToLocalQuads = 100.0 / FMath::Max(CmPerLocalQuad, 1.0);
+	const double MetersToLocalQuads = 100.0 / FMath::Max(CmPerLocalQuad_XY, 1.0);
 
 	TArray<TObjectPtr<ULandscapeSplineControlPoint>>& AllCPs = SplinesComp->GetControlPoints();
 	TArray<TObjectPtr<ULandscapeSplineSegment>>& AllSegments = SplinesComp->GetSegments();
@@ -2264,36 +2483,32 @@ void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landsca
 		const FMapboxRoadClassSettings& Class = RoadClasses[Road.RoadClassIndex];
 		if (!Class.bEnabled || Road.LandscapePixels.Num() < 2) continue;
 
-		// Resample the polyline by ControlPointSpacingMeters so we don't produce one CP per source vertex
-		// (MVT polylines can be very dense). Cubic-Hermite handles the in-between curvature.
-		const double SpacingLocalQuads = FMath::Max(1.0, (double)Class.ControlPointSpacingMeters * MetersToLocalQuads);
+		// Use source MVT vertices directly. Mapbox already simplifies polylines appropriately for the
+		// target zoom (typically a vertex every 50–300m on highways, denser at curves). The previous
+		// uniform-arclength resample at 20m intervals produced ~50 CPs/km which crushed editor performance
+		// with thousands of sprite icons. We only subdivide a segment if it exceeds MaxSegmentLengthMeters.
+		const double MaxSegLocalQuads = FMath::Max(1.0, (double)Class.MaxSegmentLengthMeters * MetersToLocalQuads);
 
-		// Pre-compute cumulative arclength along the polyline so we can sample at uniform spacing.
-		TArray<double> CumLen;
-		CumLen.SetNumZeroed(Road.LandscapePixels.Num());
-		double TotalLen = 0.0;
+		TArray<FVector2D> SampledPixels;
+		SampledPixels.Reserve(Road.LandscapePixels.Num());
+		SampledPixels.Add(Road.LandscapePixels[0]);
 		for (int32 i = 1; i < Road.LandscapePixels.Num(); ++i)
 		{
-			TotalLen += FVector2D::Distance(Road.LandscapePixels[i - 1], Road.LandscapePixels[i]);
-			CumLen[i] = TotalLen;
+			const FVector2D& Prev = Road.LandscapePixels[i - 1];
+			const FVector2D& Curr = Road.LandscapePixels[i];
+			const double SegLen = FVector2D::Distance(Prev, Curr);
+			if (SegLen > MaxSegLocalQuads)
+			{
+				const int32 NumExtra = FMath::CeilToInt(SegLen / MaxSegLocalQuads) - 1;
+				for (int32 e = 1; e <= NumExtra; ++e)
+				{
+					const double T = (double)e / (NumExtra + 1);
+					SampledPixels.Add(FMath::Lerp(Prev, Curr, T));
+				}
+			}
+			SampledPixels.Add(Curr);
 		}
-		if (TotalLen < 1.0) continue; // collapsed polyline
-
-		const int32 NumSamples = FMath::Max(2, FMath::CeilToInt(TotalLen / SpacingLocalQuads) + 1);
-		TArray<FVector2D> SampledPixels;
-		SampledPixels.Reserve(NumSamples);
-		for (int32 s = 0; s < NumSamples; ++s)
-		{
-			const double Target = (double)s / (NumSamples - 1) * TotalLen;
-			// Binary-ish walk forward through CumLen.
-			int32 Seg = 0;
-			while (Seg + 1 < CumLen.Num() && CumLen[Seg + 1] < Target) { ++Seg; }
-			const double SegLen = (Seg + 1 < CumLen.Num()) ? (CumLen[Seg + 1] - CumLen[Seg]) : 1.0;
-			const double T = (SegLen > 0.0) ? (Target - CumLen[Seg]) / SegLen : 0.0;
-			const FVector2D A = Road.LandscapePixels[Seg];
-			const FVector2D B = Road.LandscapePixels[FMath::Min(Seg + 1, Road.LandscapePixels.Num() - 1)];
-			SampledPixels.Add(FMath::Lerp(A, B, T));
-		}
+		if (SampledPixels.Num() < 2) continue;
 
 		// Build a chain of control points + segments. Each CP location is in landscape-local space.
 		TArray<ULandscapeSplineControlPoint*> ChainCPs;
@@ -2301,11 +2516,18 @@ void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landsca
 		for (int32 s = 0; s < SampledPixels.Num(); ++s)
 		{
 			const FVector2D& P = SampledPixels[s];
+			// Local XY: 1 unit = 1 landscape quad. World XY: ChunkOrigin + LocalXY * CmPerLocalQuad_XY.
+			const double LocalX = P.X * LocalUnitsPerLandscapePixel;
+			const double LocalY = P.Y * LocalUnitsPerLandscapePixel;
+			const double WorldX = ChunkOrigin.X + LocalX * CmPerLocalQuad_XY;
+			const double WorldY = ChunkOrigin.Y + LocalY * CmPerLocalQuad_XY;
+			const double WorldZ = SampleWorldZ(WorldX, WorldY) + Class.RaiseAboveTerrainCm;
+			// Local Z = (worldZ - originZ) / actorScaleZ. The spline component stores positions before
+			// the actor transform applies, so we divide out the Z scale.
+			const double LocalZ = (WorldZ - ChunkOrigin.Z) / FMath::Max(LandscapeZScale, 1.0);
+
 			ULandscapeSplineControlPoint* CP = NewObject<ULandscapeSplineControlPoint>(SplinesComp, NAME_None, RF_Transactional);
-			CP->Location = FVector(
-				P.X * LocalUnitsPerLandscapePixel,
-				P.Y * LocalUnitsPerLandscapePixel,
-				HeightmapZ(FMath::RoundToInt(P.X), FMath::RoundToInt(P.Y)) + Class.RaiseAboveTerrainCm / FMath::Max(LandscapeZScale, 1.0) * 128.0);
+			CP->Location = FVector(LocalX, LocalY, LocalZ);
 			CP->Width = (Class.SplineWidthMeters * 0.5f) * (float)MetersToLocalQuads;
 			CP->SideFalloff = FMath::Max(1.0f, ((Class.PaintWidthMeters - Class.SplineWidthMeters) * 0.5f) * (float)MetersToLocalQuads);
 			CP->LayerName = Class.PaintLayer;
@@ -2354,6 +2576,17 @@ void UMapboxImporterConfig::GenerateRoadSplinesForChunk(ALandscapeProxy* Landsca
 	{
 		SplinesComp->RebuildAllSplines(/*bBuildCollision=*/true);
 	}
+
+	// Hide the editor control-point sprites. With thousands of CPs across a fetch the default sprite
+	// icons (a small mountain texture) tile-fill the viewport and make the editor unusable. Users who
+	// want to edit splines can still select control points via wireframe + box select; the sprites
+	// aren't load-bearing.
+#if WITH_EDITORONLY_DATA
+	if (bHideSplineEditorSprites)
+	{
+		SplinesComp->ControlPointSprite = nullptr;
+	}
+#endif
 
 	UE_LOG(LogMapbox, Log, TEXT("Mapbox: %s — added %d road control points / %d segments."),
 		*Landscape->GetActorLabel(), TotalControlPoints, TotalSegments);
@@ -2540,4 +2773,5 @@ void UMapboxImporterConfig::FinishFetch()
 	FailedHeightBlobs = 0;
 	PendingDownloadQueue.Reset();
 	CompletedBlobs.Reset();
+	FetchMode = EFetchMode::Landscape;
 }

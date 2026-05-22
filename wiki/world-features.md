@@ -1,25 +1,34 @@
 # World features (roads, paths, railways)
 
-Procedural worldbuilding from OSM data, generated alongside the landscape fetch. Like Blosm's "Import roads and paths" + "Import railways" checkboxes but using Epic's built-in landscape spline system as the output.
+Procedural worldbuilding from OSM data, **run as a separate step after the landscape fetch**. Same idea as Blosm's "Import roads and paths" + "Import railways" checkboxes, but UE-native: output goes into Epic's built-in landscape spline system.
 
-## What gets generated
+> **Important:** World features used to auto-run during fetch. They don't anymore — fetches are heavy enough without piling more work on top, and you usually want to verify the terrain looks right before spending more time. Now there's a dedicated `Populate World Features` action button.
 
-For each road/path/railway in the fetched area, the plugin creates:
+## Workflow
 
-- One `ULandscapeSplineControlPoint` per ~20 m along the polyline (configurable)
-- `ULandscapeSplineSegment`s connecting them, with a user-assigned static mesh swept along
-- Optional landscape paint deformation (e.g. paint a Sand layer along the road for Brushify-style dust shoulders)
+1. Fetch the landscape normally (`Fetch Landscape` button). World features are skipped.
+2. After fetch completes, the landscape actors exist in the level. Save the level.
+3. In the importer panel, scroll to `Mapbox > World Features`:
+   - Tick `Populate Roads`
+   - Assign meshes to the `Road Classes` you care about
+4. Click the `Populate World Features` action button.
+5. The plugin re-fetches just the Mapbox vector tiles (~half the HTTP requests of the original fetch — no height/metadata/satellite) and drops landscape splines onto each existing `MapboxLandscape_*` actor.
 
-These live on each spawned `ALandscape`'s `ULandscapeSplinesComponent` — the same system Epic's built-in landscape spline tools use. So everything that works for hand-authored splines (terrain deformation, mesh tiling, painting) works here too. You can also edit, extend, or delete them after the fact in the standard Landscape Spline Mode.
+The populate is much faster than the original fetch because:
+- Only vector tiles get re-downloaded (~1 KB/tile each)
+- No landscape components, no heightmap textures, no BC7 compilation
+- No World Partition conversion
 
-## Enable it
+Typical timing: ~5 minutes total for a 30 km region's road populate vs. 8+ hours for the original landscape fetch.
 
-In the importer panel:
+## Why the split?
 
-1. Tick `Mapbox > World Features > Roads > Generate Road Splines`
-2. Click `Reset Road Classes To Defaults` to populate the default set (motorway, primary, secondary, tertiary, residential, path, rail)
-3. For each road class you actually want, assign a `Spline Mesh` (asset reference). Without a mesh, the class still creates spline control points + paint deformation but no visible mesh.
-4. Fetch as normal — roads get generated chunk-by-chunk during the fetch.
+Original design had world features inline with fetch. Two problems:
+
+1. **Fetch is already overnight territory at large radii.** Adding splines made an already-heavy step heavier.
+2. **You can't tell if the road settings are right until you see them.** With inline generation, you commit hours of fetch before knowing whether your road mesh + paint layer choices produce the look you want. Decoupled populate lets you iterate in minutes.
+
+The populate can also be re-run any time. Want to try different road meshes? Clear the splines via Landscape Mode → Spline → Select All → Delete, change the settings, click `Populate World Features` again.
 
 ## Per-class settings
 
@@ -36,7 +45,7 @@ Each `FMapboxRoadClassSettings` entry has:
 | `Paint Layer` | Landscape weight layer to paint along the road. e.g. `Sand` for Brushify-style dust. `NAME_None` = no paint |
 | `Paint Width (Meters)` | Width of paint deformation. Usually wider than `SplineWidthMeters` so the paint overlaps the road shoulder |
 | `Raise Above Terrain (Cm)` | Lifts the spline above the heightmap to prevent z-fighting (default 5 cm) |
-| `Control Point Spacing (Meters)` | How dense the control points are. 20 m is fine for most roads; 5 m for tight switchbacks |
+| `Max Segment Length (Meters)` | If a source MVT polyline segment exceeds this, it gets subdivided. Default 100 m. Raise to 200+ if editor performance is bad |
 
 ## The "Brushify road dust" recipe
 
@@ -45,13 +54,27 @@ Brushify road kits look great when there's a sandy shoulder transitioning into t
 1. Make sure your `MapboxLayers` config includes a `Sand` layer with a Sand-colored material/texture.
 2. Set the road class's `Paint Layer = "Sand"` and `Paint Width Meters` ≈ 1.5× the road width.
 3. Assign your Brushify road mesh to `Spline Mesh`.
-4. Fetch.
+4. Click `Populate World Features`.
 
 Result: every road sits on a sand-painted strip wider than the road itself, blending into surrounding grass/dirt/etc. via the landscape material's layer blending.
 
 You can do the same with any layer you have — `DrySoil` for dirt-road shoulders, `Mud` for swampy environments, `Rock` for mountain switchbacks, etc.
 
-## Common config: typical Brushify-style assignments
+## Editor sprite icons (the "mountain icons everywhere" problem)
+
+The first version of this feature produced ~50 control points per km of road, each with a small mountain-shaped editor sprite icon. At city density that filled the viewport with sprite icons and made the editor unusable.
+
+Two fixes:
+
+1. **Source-vertex spacing instead of fixed resampling.** Mapbox already simplifies polylines for the target zoom (typically a vertex every 50–300 m). We now use those source vertices directly, only subdividing if a segment exceeds `Max Segment Length Meters` (default 100 m). For typical OSM data this produces 5-10× fewer control points than the old algorithm.
+
+2. **Sprite icons hidden by default.** A new `Hide Spline Editor Sprites` checkbox (default ON) sets the spline component's `ControlPointSprite` to nullptr after population. The splines still work — you can still select and edit control points via Landscape Mode → Spline → wireframe + box-select — but the viewport stops drowning in icons.
+
+If you want the icons back for editing:
+- Untick `Hide Spline Editor Sprites` before populating, or
+- Re-set `ControlPointSprite` on the spline component manually in details
+
+## Default-table cheat sheet
 
 | Class | Match | Width m | Paint Width m | Paint Layer |
 |---|---|---|---|---|
@@ -61,7 +84,7 @@ You can do the same with any layer you have — `DrySoil` for dirt-road shoulder
 | Tertiary | `tertiary` | 7 | 10 | DrySoil |
 | Residential | `residential, service` | 6 | 8 | DrySoil |
 | Path | `path, pedestrian, track, footway` | 2 | 3 | DrySoil |
-| Railway | `major_rail, minor_rail` | 4 | 6 | *(none — sleepers handle it)* |
+| Railway | `major_rail, minor_rail` | 4 | 6 | *(none)* |
 
 (`Reset Road Classes To Defaults` populates exactly this — only the `Spline Mesh` references are left empty for you to assign.)
 
@@ -69,31 +92,33 @@ You can do the same with any layer you have — `DrySoil` for dirt-road shoulder
 
 ### Chunk boundaries
 
-Each chunk's roads live on its own landscape's spline component. A road that crosses two chunks is generated as two separate spline runs (one per chunk), each ending at the chunk boundary. Visually they should butt up cleanly because both runs are sourced from the same OSM polyline and use the same mesh. If you see a visible seam, check that your road mesh tiles seamlessly along its forward axis.
+Each chunk's roads live on its own landscape's spline component. A road that crosses two chunks is generated as two separate spline runs (one per chunk), each ending at the chunk boundary. Visually they should butt up cleanly because both runs come from the same OSM polyline and use the same mesh. If you see a visible seam, check that your road mesh tiles seamlessly along its forward axis.
+
+### Heights come from line traces
+
+Populate doesn't have the heightmap in memory anymore. Each control point's Z is sampled via a world-space line trace down against the landscape collision. This means:
+
+- Landscape collision must be loaded. For most populate runs this Just Works because either the landscape is freshly fetched (collision loads on Import) or you're populating after editor restart (collision loads with the level).
+- For World-Partition-converted regions, **proxies near the populate area need to be loaded**. WP usually loads them within the editor's loading range, but if you've moved the camera far away you might need to fly back into the area before populating.
+- If the line trace misses (no collision at that XY), the control point falls back to the landscape actor's Z. Result: a flat patch of road at the wrong height. Fix by reloading the missing proxy and re-populating.
+
+### "Settings must match the original fetch"
+
+The populate uses your current `Center Lat/Lng/Radius/Zoom` to know which Mapbox tiles to fetch. **Those must match the fetch that produced the landscapes you're decorating.** If you changed the lat/lng after fetching, the populate fetches the wrong tiles, no landscapes match, and nothing happens.
+
+A future version will save fetch metadata into a per-level data asset so this can't desync.
 
 ### Cross-class roads
 
-OSM tags can disagree with our defaults (e.g. an OSM "primary" that locals would call residential, or vice versa). If you want finer control, edit `Mvt Class Matches` per class. The match is on the `class` property of each OSM feature in the `road` vector layer.
-
-### "Roads are floating above the ground" or "in the ground"
-
-Tune `Raise Above Terrain Cm` (default 5). Negative isn't supported; if you need to sink roads, edit their `Z` after generation in Landscape Spline Mode.
-
-### "Mesh stretches/squashes wrong"
-
-Spline mesh tiling along the spline depends on the mesh's local +X length. Set `Center Adjust` in the `FLandscapeSplineMeshEntry` (the plugin sets `bCenterH = true` by default) if it's off-center. If the mesh is tiled too tightly, increase `Control Point Spacing Meters` — fewer control points = longer segments = the mesh stretches over a longer span.
+OSM tags can disagree with our defaults (e.g. an OSM "primary" that locals would call residential). If you want finer control, edit `Mvt Class Matches` per class. The match is on the `class` property of each OSM feature in the `road` vector layer.
 
 ### "I want to edit the generated roads"
 
-Select the landscape, switch to `Landscape Mode > Manage > Spline`. All the generated control points and segments appear in the standard spline editor and behave like hand-authored ones.
+Select the landscape, switch to `Landscape Mode > Manage > Spline`. All the generated control points and segments appear in the standard spline editor. You can drag, delete, add segments, change widths, etc.
 
-### "Performance impact"
+### Performance impact at runtime
 
-Spline mesh components are real instanced static meshes. Each segment becomes one `USplineMeshComponent`. For dense urban areas with many short roads, this can add up — expect 100s to 1000s of spline-mesh components per chunk. World Partition still streams them with their parent landscape, so distant chunks unload normally.
-
-### "Roads aren't getting WP-streamed"
-
-`USplineMeshComponent`s attached to a streaming proxy via the `bPlaceSplineMeshesInStreamingLevels` flag (default true on segments) will stream with their proxy. If you're seeing roads stay loaded when distant, check that flag is true on a sample segment.
+Spline mesh components are real instanced static meshes. Each segment becomes one `USplineMeshComponent`. Roads in a dense urban area can produce hundreds per chunk, but WP streams them with their parent landscape so distant chunks unload.
 
 ## What's NOT in this feature yet
 
@@ -103,4 +128,4 @@ This is the roads/paths/railways implementation. Coming separately:
 - **Water objects** — flat plane meshes for water polygons
 - **Forests + vegetation** — polygon-bounded HISM scatter (current scatter is per-landscape-layer)
 
-See the README for the full plan.
+Each will get its own checkbox in `Mapbox > World Features` and slot into the same `Populate World Features` button.

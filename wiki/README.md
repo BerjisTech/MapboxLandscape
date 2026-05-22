@@ -25,4 +25,4 @@ Practical operating notes for the plugin. Read these before complaining about lo
 | Smoother cliffs/slopes | Increase `HeightZoomBonus` to 1 (small areas only — 4× height requests) |
 | More streaming granularity | Reduce `WorldPartitionGridSizeInComponents` (default 16 → 8 = 4× as many proxies) |
 | Cancel a running fetch | Click `Cancel Fetch` in the importer panel |
-| Generate roads + paths + rails from OSM | Tick `Generate Road Splines`, click `Reset Road Classes To Defaults`, assign meshes, fetch. See [world-features.md](world-features.md) |
+| Generate roads + paths + rails from OSM | After landscape fetch: tick `Populate Roads`, click `Reset Road Classes To Defaults`, assign meshes, click `Populate World Features`. See [world-features.md](world-features.md) |
