@@ -188,16 +188,39 @@ void UMapboxImporterConfig::EnsureDefaultLayers()
 	}
 }
 
+TArray<FString> FMapboxRoadClassSettings::GetDefaultMvtMatchesForClass(EMapboxRoadClass InClass)
+{
+	switch (InClass)
+	{
+	case EMapboxRoadClass::Motorway:    return { TEXT("motorway"),  TEXT("motorway_link") };
+	case EMapboxRoadClass::Trunk:       return { TEXT("trunk"),     TEXT("trunk_link") };
+	case EMapboxRoadClass::Primary:     return { TEXT("primary"),   TEXT("primary_link") };
+	case EMapboxRoadClass::Secondary:   return { TEXT("secondary"), TEXT("secondary_link") };
+	case EMapboxRoadClass::Tertiary:    return { TEXT("tertiary"),  TEXT("tertiary_link") };
+	case EMapboxRoadClass::Residential: return { TEXT("residential") };
+	case EMapboxRoadClass::Service:     return { TEXT("service") };
+	case EMapboxRoadClass::Pedestrian:  return { TEXT("pedestrian") };
+	case EMapboxRoadClass::Path:        return { TEXT("path") };
+	case EMapboxRoadClass::Footway:     return { TEXT("footway") };
+	case EMapboxRoadClass::Track:       return { TEXT("track") };
+	case EMapboxRoadClass::Cycleway:    return { TEXT("cycleway") };
+	case EMapboxRoadClass::Steps:       return { TEXT("steps") };
+	case EMapboxRoadClass::MajorRail:   return { TEXT("major_rail") };
+	case EMapboxRoadClass::MinorRail:   return { TEXT("minor_rail") };
+	case EMapboxRoadClass::Custom:      return {};
+	default:                            return {};
+	}
+}
+
 void UMapboxImporterConfig::ResetRoadClassesToDefaults()
 {
-	auto MakeClass = [](FName ClassName, std::initializer_list<const TCHAR*> Matches,
-		float Width, float PaintWidth, FName PaintLayer)
+	auto MakeClass = [](EMapboxRoadClass C, float Width, float PaintWidth, FName PaintLayer)
 	{
 		FMapboxRoadClassSettings R;
-		R.ClassName = ClassName;
+		R.Class = C;
 		R.bEnabled = true;
 		R.MvtLayer = TEXT("road");
-		for (const TCHAR* M : Matches) { R.MvtClassMatches.Add(FString(M)); }
+		R.MvtClassMatches.Reset(); // empty — Class dropdown drives matching
 		R.SplineWidthMeters = Width;
 		R.PaintWidthMeters = PaintWidth;
 		R.PaintLayer = PaintLayer;
@@ -208,13 +231,18 @@ void UMapboxImporterConfig::ResetRoadClassesToDefaults()
 
 	RoadClasses.Empty();
 	// Width / paint values calibrated against typical Brushify road meshes and OSM-real road widths.
-	RoadClasses.Add(MakeClass(TEXT("Motorway"),    { TEXT("motorway") },                       18.f, 24.f, TEXT("Sand")));
-	RoadClasses.Add(MakeClass(TEXT("Primary"),     { TEXT("primary"), TEXT("trunk") },         12.f, 16.f, TEXT("Sand")));
-	RoadClasses.Add(MakeClass(TEXT("Secondary"),   { TEXT("secondary") },                       9.f, 12.f, TEXT("Sand")));
-	RoadClasses.Add(MakeClass(TEXT("Tertiary"),    { TEXT("tertiary") },                        7.f, 10.f, TEXT("DrySoil")));
-	RoadClasses.Add(MakeClass(TEXT("Residential"), { TEXT("residential"), TEXT("service") },    6.f,  8.f, TEXT("DrySoil")));
-	RoadClasses.Add(MakeClass(TEXT("Path"),        { TEXT("path"), TEXT("pedestrian"), TEXT("track"), TEXT("footway") }, 2.f, 3.f, TEXT("DrySoil")));
-	RoadClasses.Add(MakeClass(TEXT("Railway"),     { TEXT("major_rail"), TEXT("minor_rail") },  4.f,  6.f, NAME_None));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Motorway,    18.f, 24.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Trunk,       14.f, 18.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Primary,     12.f, 16.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Secondary,    9.f, 12.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Tertiary,     7.f, 10.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Residential,  6.f,  8.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Service,      4.f,  6.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Path,         2.f,  3.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Footway,      1.5f, 2.5f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Track,        3.f,  5.f, TEXT("DrySoil")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::MajorRail,    4.f,  6.f, NAME_None));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::MinorRail,    3.f,  5.f, NAME_None));
 
 #if WITH_EDITOR
 	PostEditChange();
@@ -2104,6 +2132,18 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 
 			if (bPopulateRoads)
 			{
+				// Pre-compute effective MVT class matches per road class: explicit override if non-empty,
+				// otherwise default for the enum. Built once per chunk, reused across tiles.
+				TArray<TArray<FString>> EffectiveMatches;
+				EffectiveMatches.SetNum(RoadClasses.Num());
+				for (int32 RoadIdx = 0; RoadIdx < RoadClasses.Num(); ++RoadIdx)
+				{
+					const FMapboxRoadClassSettings& RC = RoadClasses[RoadIdx];
+					EffectiveMatches[RoadIdx] = RC.MvtClassMatches.IsEmpty()
+						? FMapboxRoadClassSettings::GetDefaultMvtMatchesForClass(RC.Class)
+						: RC.MvtClassMatches;
+				}
+
 				for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
 				{
 					for (int32 RoadIdx = 0; RoadIdx < RoadClasses.Num(); ++RoadIdx)
@@ -2111,13 +2151,14 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 						const FMapboxRoadClassSettings& RC = RoadClasses[RoadIdx];
 						if (!RC.bEnabled) continue;
 						if (!RC.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
+						if (EffectiveMatches[RoadIdx].IsEmpty()) continue; // Custom with empty overrides — skip
 
 						const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
 
 						for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
 						{
 							if (Feature.Type != MapboxMvt::EFeatureType::LineString) continue;
-							if (!MapboxMvt::FeatureMatchesClass(Feature, RC.MvtClassMatches)) continue;
+							if (!MapboxMvt::FeatureMatchesClass(Feature, EffectiveMatches[RoadIdx])) continue;
 
 							for (const TArray<FVector2D>& Line : Feature.Geometry)
 							{

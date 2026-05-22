@@ -129,11 +129,40 @@ struct FMapboxLayerDef
 };
 
 /**
+ * Common OpenStreetMap road classifications from the Mapbox Streets v8 vector tileset. Pick one of
+ * these from the dropdown when configuring a road class entry. Internally each value maps to a
+ * fixed set of MVT `class` property values (including `_link` variants where applicable) — so
+ * "Motorway" matches both `motorway` and `motorway_link` OSM features.
+ *
+ * Use `Custom` if you need to match a non-standard combination (e.g. landuse=quarry as a "road").
+ * In that case the explicit `MvtClassMatches` array on the row drives matching instead.
+ */
+UENUM(BlueprintType)
+enum class EMapboxRoadClass : uint8
+{
+	Motorway     UMETA(DisplayName = "Motorway (interstate/freeway)"),
+	Trunk        UMETA(DisplayName = "Trunk (highway, expressway)"),
+	Primary      UMETA(DisplayName = "Primary (major arterial)"),
+	Secondary    UMETA(DisplayName = "Secondary (regional)"),
+	Tertiary     UMETA(DisplayName = "Tertiary (local connector)"),
+	Residential  UMETA(DisplayName = "Residential (neighborhood street)"),
+	Service      UMETA(DisplayName = "Service (alley, driveway, parking)"),
+	Pedestrian   UMETA(DisplayName = "Pedestrian (urban walkway)"),
+	Path         UMETA(DisplayName = "Path (unpaved trail)"),
+	Footway      UMETA(DisplayName = "Footway (sidewalk)"),
+	Track        UMETA(DisplayName = "Track (dirt/farm road)"),
+	Cycleway     UMETA(DisplayName = "Cycleway (bike lane)"),
+	Steps        UMETA(DisplayName = "Steps (stairs)"),
+	MajorRail    UMETA(DisplayName = "Major Rail (mainline railway)"),
+	MinorRail    UMETA(DisplayName = "Minor Rail (yard, siding, light rail)"),
+	Custom       UMETA(DisplayName = "Custom (use the MvtClassMatches array below)")
+};
+
+/**
  * Per-road-class visual settings for the World Features generator. Each entry describes one class
- * of OpenStreetMap road (e.g. motorway, primary, residential, path, rail) and how the plugin should
- * render it on the landscape: which static mesh to sweep along the spline, which landscape paint
- * layer to apply for road-shoulder color (e.g. Sand for Brushify-style dust), and how wide to make
- * the spline mesh + paint deformation.
+ * of OpenStreetMap road and how the plugin should render it on the landscape: which static mesh
+ * to sweep along the spline, which landscape paint layer to apply for road-shoulder color (e.g.
+ * Sand for Brushify-style dust), and how wide to make the spline mesh + paint deformation.
  *
  * Maps to Epic's built-in ULandscapeSplineSegment system — the engine handles mesh tiling and
  * landscape paint deformation; we just feed it the polyline geometry and the per-segment specs.
@@ -143,16 +172,16 @@ struct FMapboxRoadClassSettings
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Display name. Doesn't affect generation — just helps you find this entry in the array."))
-	FName ClassName = TEXT("Residential");
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Pick the OpenStreetMap road class this row should match. The dropdown options correspond to the standard Mapbox Streets v8 'class' values; the plugin handles the underlying `_link` variants automatically (e.g. Motorway matches both `motorway` and `motorway_link`). Pick `Custom` to supply your own MVT class strings via the MvtClassMatches array below."))
+	EMapboxRoadClass Class = EMapboxRoadClass::Residential;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "If off, this class is skipped. Useful for testing one class at a time without deleting the others."))
 	bool bEnabled = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Mapbox Streets v8 layer to read from. 'road' for streets/paths/rails. Default is 'road' and you rarely need anything else."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", AdvancedDisplay, meta = (ToolTip = "Mapbox Streets v8 layer to read from. 'road' for streets/paths/rails. You rarely need anything else."))
 	FString MvtLayer = TEXT("road");
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Match features whose 'class' property is one of these. Examples:\n  ['motorway']                    — interstates/freeways\n  ['primary', 'trunk']            — major roads\n  ['secondary', 'tertiary']       — regional\n  ['residential', 'service']      — neighborhood streets\n  ['path', 'pedestrian', 'track'] — footpaths\n  ['major_rail', 'minor_rail']    — railways"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", AdvancedDisplay, meta = (ToolTip = "Override list of MVT `class` property values to match. ONLY used if the Class dropdown is set to Custom, OR if this array is non-empty (in which case it overrides the dropdown's defaults). Examples: ['motorway','motorway_link'] for interstates, ['major_rail','minor_rail'] for railways, ['landuse=quarry'] for unusual cases. Leave empty to let the Class dropdown drive matching."))
 	TArray<FString> MvtClassMatches;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ToolTip = "Spline mesh swept along the road. Should be aligned so its local +X axis is the forward direction. Compatible with Brushify road kits, Epic's spline road meshes, or any single-axis mesh. Leave empty to skip mesh generation (paint layer still applies)."))
@@ -172,4 +201,9 @@ struct FMapboxRoadClassSettings
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Class", meta = (ClampMin = "10.0", ToolTip = "If a source polyline segment is longer than this, it gets subdivided into smaller chunks. Otherwise the plugin uses the original MVT vertices directly — Mapbox already simplifies polylines appropriately for the zoom level. Smaller values = more control points + smoother terrain following on long straight stretches; larger values = fewer control points + better editor performance. 100 m hits a reasonable balance; raise to 200 m if your editor lags from spline sprite icons."))
 	float MaxSegmentLengthMeters = 100.0f;
+
+	/** Maps an enum value to its corresponding MVT `class` strings. The engine matches roads against
+	 *  these (case-insensitive). Returns an empty array for Custom — caller should fall back to the
+	 *  user-supplied MvtClassMatches in that case. */
+	static MAPBOXLANDSCAPE_API TArray<FString> GetDefaultMvtMatchesForClass(EMapboxRoadClass InClass);
 };

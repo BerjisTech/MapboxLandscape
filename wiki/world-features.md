@@ -36,16 +36,16 @@ Each `FMapboxRoadClassSettings` entry has:
 
 | Field | What it controls |
 |---|---|
-| `Class Name` | Display label, doesn't affect generation |
+| `Class` | **Dropdown.** Pick one of the standard OSM road classes (Motorway, Trunk, Primary, Secondary, Tertiary, Residential, Service, Pedestrian, Path, Footway, Track, Cycleway, Steps, Major Rail, Minor Rail). The plugin handles the `_link` variants automatically. Pick `Custom` if you want to match an unusual combination via `MvtClassMatches` |
 | `Enabled` | Per-class on/off without deleting the entry |
-| `Mvt Layer` | Which Mapbox vector layer to read from. Almost always `road` (handles roads, paths, AND rails) |
-| `Mvt Class Matches` | OSM `class` property values this entry matches. e.g. `['motorway']`, `['major_rail', 'minor_rail']`, `['path', 'pedestrian', 'track']` |
 | `Spline Mesh` | Mesh swept along the spline. Local +X should be the forward direction. Compatible with Brushify, Epic spline meshes, or any axis-aligned road mesh |
 | `Spline Width (Meters)` | Mesh footprint width — should match what your road mesh expects |
 | `Paint Layer` | Landscape weight layer to paint along the road. e.g. `Sand` for Brushify-style dust. `NAME_None` = no paint |
 | `Paint Width (Meters)` | Width of paint deformation. Usually wider than `SplineWidthMeters` so the paint overlaps the road shoulder |
 | `Raise Above Terrain (Cm)` | Lifts the spline above the heightmap to prevent z-fighting (default 5 cm) |
 | `Max Segment Length (Meters)` | If a source MVT polyline segment exceeds this, it gets subdivided. Default 100 m. Raise to 200+ if editor performance is bad |
+| **Advanced:** `Mvt Layer` | Which Mapbox Streets v8 layer to read from. Default `road`; you rarely change this |
+| **Advanced:** `Mvt Class Matches` | Override the OSM class strings the `Class` dropdown would match. Leave empty unless you set `Class = Custom` or you specifically want different matching |
 
 ## The "Brushify road dust" recipe
 
@@ -76,15 +76,20 @@ If you want the icons back for editing:
 
 ## Default-table cheat sheet
 
-| Class | Match | Width m | Paint Width m | Paint Layer |
+| Class | OSM `class` matched | Width m | Paint Width m | Paint Layer |
 |---|---|---|---|---|
-| Motorway | `motorway` | 18 | 24 | Sand |
-| Primary | `primary, trunk` | 12 | 16 | Sand |
-| Secondary | `secondary` | 9 | 12 | Sand |
-| Tertiary | `tertiary` | 7 | 10 | DrySoil |
-| Residential | `residential, service` | 6 | 8 | DrySoil |
-| Path | `path, pedestrian, track, footway` | 2 | 3 | DrySoil |
-| Railway | `major_rail, minor_rail` | 4 | 6 | *(none)* |
+| Motorway | `motorway`, `motorway_link` | 18 | 24 | Sand |
+| Trunk | `trunk`, `trunk_link` | 14 | 18 | Sand |
+| Primary | `primary`, `primary_link` | 12 | 16 | Sand |
+| Secondary | `secondary`, `secondary_link` | 9 | 12 | Sand |
+| Tertiary | `tertiary`, `tertiary_link` | 7 | 10 | DrySoil |
+| Residential | `residential` | 6 | 8 | DrySoil |
+| Service | `service` | 4 | 6 | DrySoil |
+| Path | `path` | 2 | 3 | DrySoil |
+| Footway | `footway` | 1.5 | 2.5 | DrySoil |
+| Track | `track` | 3 | 5 | DrySoil |
+| Major Rail | `major_rail` | 4 | 6 | *(none)* |
+| Minor Rail | `minor_rail` | 3 | 5 | *(none)* |
 
 (`Reset Road Classes To Defaults` populates exactly this — only the `Spline Mesh` references are left empty for you to assign.)
 
