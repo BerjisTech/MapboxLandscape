@@ -3,13 +3,13 @@
 	"Version": 2,
 	"VersionName": "2.0",
 	"FriendlyName": "Mapbox Landscape",
-	"Description": "Fetches Mapbox terrain, satellite and metadata tiles and creates real-world UE landscapes with user-defined layer rules and PCG scatter.",
+	"Description": "Fetches Mapbox terrain, satellite and metadata tiles and creates real-world UE landscapes with user-defined layer rules and PCG scatter. Requires your own Mapbox API key; subject to Mapbox Terms of Service.",
 	"Category": "Landscape",
-	"CreatedBy": "Airmuseum",
-	"CreatedByURL": "",
-	"DocsURL": "",
+	"CreatedBy": "BerjisTech",
+	"CreatedByURL": "https://github.com/BerjisTech",
+	"DocsURL": "https://github.com/BerjisTech/MapboxLandscape/tree/master/wiki",
 	"MarketplaceURL": "",
-	"SupportURL": "",
+	"SupportURL": "https://github.com/BerjisTech/MapboxLandscape/issues",
 	"CanContainContent": true,
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
@@ -18,7 +18,8 @@
 		{
 			"Name": "MapboxLandscape",
 			"Type": "Editor",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [ "Win64" ]
 		}
 	],
 	"Plugins": [

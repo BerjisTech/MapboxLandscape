@@ -22,6 +22,14 @@ public:
 	UPROPERTY(EditAnywhere, config, Category = "API", meta = (ToolTip = "Your Mapbox access token. Stored in DefaultMapboxLandscape.ini."))
 	FString ApiKey;
 
+	// --- Mapbox TOS acknowledgement ---
+	// Persisted so the Importer panel only shows the TOS banner until the user clicks
+	// "I understand". Per-project (DefaultMapboxLandscape.ini) rather than per-user — if
+	// you open someone else's project you'll see the banner again, which is the safer
+	// default because the consent is contextual to the work being done.
+	UPROPERTY(config)
+	bool bAcceptedMapboxTerms = false;
+
 	// --- Tile defaults ---
 	UPROPERTY(EditAnywhere, config, Category = "Defaults|Tiling")
 	FString DefaultMetadataStyleId = TEXT("mapbox/satellite-streets-v12");

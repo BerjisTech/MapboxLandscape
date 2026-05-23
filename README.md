@@ -4,6 +4,30 @@ Real-world Unreal Engine 5 landscapes built from Mapbox terrain, satellite, vect
 
 Tested on UE 5.7.
 
+## Before you start — Mapbox terms and what you can ship
+
+This plugin downloads data from Mapbox under **your** Mapbox account. The plugin itself grants you no rights to Mapbox data — Mapbox's [Terms of Service](https://www.mapbox.com/legal/tos) do.
+
+The short version:
+
+- **Geometry from terrain tiles** (the actual landscape heights) is a derivative work. Generally fine to ship in a commercial product under standard Mapbox developer terms, but check the current TOS before launch.
+- **Baked satellite imagery** in a commercial product needs a Mapbox commercial agreement that you arrange directly with Mapbox. Personal / non-commercial / evaluation use is fine.
+- **Attribution is required.** Any project that ships output from this plugin must visibly credit `© Mapbox © OpenStreetMap` (e.g. in a credits screen). The plugin stamps this string as an Unreal actor tag on every spawned landscape — look for `MapboxLandscape:Attribution` in the tags array — so a build step can scrape it automatically.
+
+The Importer panel shows a one-time acknowledgement banner the first time you open it in a new project; clicking *I understand* persists your acceptance in `DefaultMapboxLandscape.ini`.
+
+## Memory and performance
+
+Imports scale roughly linearly with area, with **auto-zoom** flattening the high end so 100km doesn't fully square the cost of 10km. Rough envelopes on a 32GB workstation:
+
+| Radius | Peak memory | Wall time | Notes |
+|---|---|---|---|
+| 5 km   | < 500 MB | minutes   | Comfortable on 8GB. |
+| 30 km  | ~1–2 GB  | ~hours    | Auto-zoom drops the source resolution to keep tile counts sane. |
+| 70+ km | ~3–4 GB peak | overnight | World Partition conversion after fetch is the long pole. |
+
+If you're on **16 GB or less**, stay under 30 km until you've watched a fetch complete once. The `wiki/memory-sizing.md` page has the formula and the per-stage breakdown.
+
 ## Install
 
 1. Drop the `MapboxLandscape` folder into your project's `Plugins/` directory.

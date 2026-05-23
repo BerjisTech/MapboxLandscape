@@ -69,7 +69,7 @@ At our default `TilesPerLandscapeSide = 4`, each chunk has 16×16 = 256 componen
 | 16 | 1 (1×1) | 169 | ~4 km | **Flight, default** |
 | 32 | 1 (still 1) | 169 | ~4 km (clamped) | Doesn't help vs 16 |
 
-For Airmuseum's flight-sim context: **16** is correct. Aircraft cross 2 km cells in seconds, generating WP load/unload churn. 4 km cells are loaded long enough for the WP load to amortize.
+For flight-sim / fast-traversal contexts: **16** is correct. Aircraft cross 2 km cells in seconds, generating WP load/unload churn. 4 km cells are loaded long enough for the WP load to amortize. For ground/walking gameplay, keep the default 8.
 
 ## Common conversion problems
 

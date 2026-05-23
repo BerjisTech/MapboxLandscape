@@ -2418,6 +2418,12 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 	ALandscape* Landscape = World->SpawnActor<ALandscape>(ALandscape::StaticClass(), Params);
 	if (!Landscape) return nullptr;
 	Landscape->SetActorLabel(FString::Printf(TEXT("MapboxLandscape_C%d_%d"), Chunk.ChunkX, Chunk.ChunkY));
+
+	// Mapbox + OSM attribution required by their TOS — stamped as actor tags so it
+	// survives in saved levels and a Build-step script can scrape it out of every
+	// scene to populate a credits screen. See LICENSE.md.
+	Landscape->Tags.AddUnique(TEXT("MapboxLandscape:Attribution=© Mapbox © OpenStreetMap"));
+	Landscape->Tags.AddUnique(TEXT("MapboxLandscape:Source"));
 	// NOTE: ALandscape::CanChangeIsSpatiallyLoadedFlag() returns false in UE5.7 (Landscape.h:324), so
 	// ALandscape actors CANNOT be marked spatially loaded directly — calling SetIsSpatiallyLoaded asserts.
 	// In 5.7, landscape streaming exclusively goes through ALandscapeStreamingProxy actors, and the only
