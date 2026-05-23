@@ -842,14 +842,14 @@ void UMapboxImporterConfig::PopulateWorldFeatures()
 		MapboxUI::Notify(MapboxUI::ESeverity::Error, TEXT("Mapbox: no editor world."), TEXT("Open a level first."));
 		return;
 	}
+	// Count only parent ALandscape actors with the MapboxLandscape_C prefix. Streaming proxies
+	// (MapboxLandscapeProxy_*) are excluded — they aren't where splines belong.
 	int32 LandscapeCountFound = 0;
-	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	for (TActorIterator<ALandscape> It(World); It; ++It)
 	{
-		ALandscapeProxy* L = *It;
+		ALandscape* L = *It;
 		if (!IsValid(L)) continue;
-		const FString Label = L->GetActorLabel();
-		const FString Name = L->GetName();
-		if (Label.StartsWith(TEXT("MapboxLandscape")) || Name.StartsWith(TEXT("MapboxLandscape")))
+		if (L->GetName().StartsWith(TEXT("MapboxLandscape_C")))
 		{
 			++LandscapeCountFound;
 		}
@@ -857,8 +857,8 @@ void UMapboxImporterConfig::PopulateWorldFeatures()
 	if (LandscapeCountFound == 0)
 	{
 		MapboxUI::Notify(MapboxUI::ESeverity::Error,
-			TEXT("Mapbox: no Mapbox-generated landscapes found in this level."),
-			TEXT("Run 'Fetch Landscape' first. World features populate operates on already-fetched landscapes — it does not create new ones."),
+			TEXT("Mapbox: no Mapbox-generated parent landscapes found in this level."),
+			TEXT("Run 'Fetch Landscape' first. World features populate operates on parent ALandscape actors (MapboxLandscape_C*_*), not on streaming proxies."),
 			/*bModal=*/true);
 		return;
 	}
@@ -1621,9 +1621,22 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 
 	GeneratedLandscapes.Reset();
 
+	// Max chunk indices, used to detect which chunk-edges face another chunk vs the import boundary.
+	// Chunks bordering another chunk get a 1-pixel apron from the neighbour's first column/row so
+	// the resampled landscape's edge vertex samples the SAME geographic position as the neighbour's
+	// first vertex — eliminating the off-by-one seam mismatch in hilly terrain.
+	int32 MaxChunkX = 0, MaxChunkY = 0;
+	for (const FLandscapeChunk& C : Chunks)
+	{
+		MaxChunkX = FMath::Max(MaxChunkX, C.ChunkX);
+		MaxChunkY = FMath::Max(MaxChunkY, C.ChunkY);
+	}
+
 	// ---- Pass B: chunk loop. Each chunk decodes its tiles, builds the landscape, and frees
 	// everything before the next iteration. Blobs are removed from CompletedBlobs as soon as
-	// they're consumed, so by chunk N the map only retains tiles for chunks N+1..end.
+	// they're consumed, so by chunk N the map only retains tiles for chunks N+1..end. (Apron
+	// reads from the right/bottom neighbour chunks happen BEFORE those neighbours are processed,
+	// so their height blobs are still in CompletedBlobs at that point — no retention needed.)
 	FScopedSlowTask SlowTask((float)Chunks.Num(), FText::FromString(TEXT("Mapbox: building landscapes...")));
 	SlowTask.MakeDialog(/*bShowCancelButton=*/false);
 
@@ -1656,13 +1669,29 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		const int32 SrcW_H = SrcW * HZScale; // height source resolution (higher when HZB>0)
 		const int32 SrcH_H = SrcH * HZScale;
 
-		SrcHeightsMeters.SetNumZeroed(SrcW_H * SrcH_H);
+		// Edge-apron sizing. Each Mapbox terrain-RGB pixel represents the geographic point at
+		// its NW corner, so the SrcW_H pixels in this chunk cover world positions
+		// [0/SrcW_H .. (SrcW_H-1)/SrcW_H] of the chunk's width — NOT the full chunk extent.
+		// The landscape actor however spans the full chunk extent, so without correction the last
+		// landscape vertex samples (SrcW_H-1) instead of the true seam pixel that the next chunk
+		// uses as its FIRST pixel. We fix this by appending one extra column/row sourced from the
+		// neighbour chunk's first column/row of pixels, so the actor's edge vertex samples exactly
+		// the same geographic point (and same height) as the neighbour's edge vertex.
+		const bool bHasRightNeighbor  = Chunk.ChunkX < MaxChunkX;
+		const bool bHasBottomNeighbor = Chunk.ChunkY < MaxChunkY;
+		const int32 ApronX = bHasRightNeighbor  ? 1 : 0;
+		const int32 ApronY = bHasBottomNeighbor ? 1 : 0;
+		const int32 SrcW_H_Padded = SrcW_H + ApronX;
+		const int32 SrcH_H_Padded = SrcH_H + ApronY;
+
+		SrcHeightsMeters.SetNumZeroed(SrcW_H_Padded * SrcH_H_Padded);
 		if (bHasColorLayer) { SrcMetadata.SetNumZeroed(SrcW * SrcH); }
 		if (bSatEnabled)    { SrcSatellite.SetNumZeroed(SrcW * SrcH); }
 
 		bool bMissing = false;
 
 		// --- Decode height tiles (one per HZScale^2 sub-position per chunk sat tile) and remove blobs.
+		// Note: writes use SrcW_H_Padded as the stride to leave the appended apron column free.
 		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
 		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
 		{
@@ -1686,7 +1715,7 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 						for (int32 px = 0; px < 256; ++px)
 						{
 							const int32 i = (py * 256 + px) * 4;
-							SrcHeightsMeters[(BaseY_H + py) * SrcW_H + (BaseX_H + px)] =
+							SrcHeightsMeters[(BaseY_H + py) * SrcW_H_Padded + (BaseX_H + px)] =
 								DecodeHeightMeters(ScratchRGBA[i], ScratchRGBA[i + 1], ScratchRGBA[i + 2]);
 						}
 					}
@@ -1695,6 +1724,85 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 				else { bMissing = true; }
 				CompletedBlobs.Remove(HKey); // free the PNG bytes; we won't need them again
 			}
+		}
+
+		// --- Edge apron: read the first column/row of the right/bottom neighbour chunks' tiles
+		// and write them into the appended apron column/row. Neighbour blobs are still alive
+		// at this point because chunks are processed in row-major order. We do NOT remove the
+		// neighbour blobs here — they'll be removed when those chunks process themselves normally.
+		auto DecodeNeighborHeightTile = [&](int32 HTileX, int32 HTileY) -> bool
+		{
+			const FString HKey = KeyFor(HTileX, HTileY, ETileKind::Height);
+			const FTileBlob* Blob = CompletedBlobs.Find(HKey);
+			if (!Blob || !Blob->bOk) return false;
+			ScratchRGBA.Reset();
+			int32 W = 0, H = 0;
+			return DecodeTileToRGBA(Blob->Bytes, ScratchRGBA, W, H) && W == 256 && H == 256;
+		};
+
+		if (bHasRightNeighbor)
+		{
+			// Right apron column = leftmost pixel column of the right neighbour's first column
+			// of height tiles, sampled at every height-tile row covered by this chunk.
+			const int32 NeighborHTileX = (Chunk.MinTileX + Chunk.TilesX) * HZScale;
+			for (int32 htRow = 0; htRow < Chunk.TilesY * HZScale; ++htRow)
+			{
+				const int32 HTileY = Chunk.MinTileY * HZScale + htRow;
+				if (DecodeNeighborHeightTile(NeighborHTileX, HTileY))
+				{
+					const int32 BaseY_H = htRow * 256;
+					for (int32 py = 0; py < 256; ++py)
+					{
+						const int32 i = (py * 256 + 0) * 4; // px = 0 (leftmost column)
+						SrcHeightsMeters[(BaseY_H + py) * SrcW_H_Padded + SrcW_H] =
+							DecodeHeightMeters(ScratchRGBA[i], ScratchRGBA[i + 1], ScratchRGBA[i + 2]);
+					}
+				}
+				// Apron stays at 0 if neighbour blob is missing — same fallback as missing chunk tiles.
+			}
+		}
+
+		if (bHasBottomNeighbor)
+		{
+			// Bottom apron row = topmost pixel row of the bottom neighbour's first row of height tiles.
+			const int32 NeighborHTileY = (Chunk.MinTileY + Chunk.TilesY) * HZScale;
+			for (int32 htCol = 0; htCol < Chunk.TilesX * HZScale; ++htCol)
+			{
+				const int32 HTileX = Chunk.MinTileX * HZScale + htCol;
+				if (DecodeNeighborHeightTile(HTileX, NeighborHTileY))
+				{
+					const int32 BaseX_H = htCol * 256;
+					for (int32 px = 0; px < 256; ++px)
+					{
+						const int32 i = (0 * 256 + px) * 4; // py = 0 (topmost row)
+						SrcHeightsMeters[SrcH_H * SrcW_H_Padded + BaseX_H + px] =
+							DecodeHeightMeters(ScratchRGBA[i], ScratchRGBA[i + 1], ScratchRGBA[i + 2]);
+					}
+				}
+			}
+		}
+
+		if (bHasRightNeighbor && bHasBottomNeighbor)
+		{
+			// Corner pixel: NW corner of the diagonal (SE) neighbour chunk's first height tile.
+			const int32 NeighborHTileX = (Chunk.MinTileX + Chunk.TilesX) * HZScale;
+			const int32 NeighborHTileY = (Chunk.MinTileY + Chunk.TilesY) * HZScale;
+			float CornerHeight = 0.f;
+			bool bCornerOk = false;
+			if (DecodeNeighborHeightTile(NeighborHTileX, NeighborHTileY))
+			{
+				CornerHeight = DecodeHeightMeters(ScratchRGBA[0], ScratchRGBA[1], ScratchRGBA[2]);
+				bCornerOk = true;
+			}
+			if (!bCornerOk)
+			{
+				// Fall back to averaging the two apron edges' nearest pixels so the corner doesn't
+				// drop to 0m and create a phantom hole at the chunk's SE vertex.
+				const float Right  = SrcHeightsMeters[(SrcH_H - 1) * SrcW_H_Padded + SrcW_H];
+				const float Bottom = SrcHeightsMeters[SrcH_H * SrcW_H_Padded + (SrcW_H - 1)];
+				CornerHeight = 0.5f * (Right + Bottom);
+			}
+			SrcHeightsMeters[SrcH_H * SrcW_H_Padded + SrcW_H] = CornerHeight;
 		}
 
 		// --- Decode metadata + satellite + parse vector for chunk sat tiles, then remove blobs.
@@ -1856,7 +1964,10 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		}
 
 		// --- Resample heights from (possibly higher-res) source to landscape verts.
-		ResampleHeights(SrcHeightsMeters, SrcW_H, SrcH_H, ResampledHeights, LandscapeVerts, LandscapeVerts);
+		// Pass the PADDED dimensions: the resampler's (SrcW-1)/(DstW-1) mapping then places the
+		// destination's last vertex at the appended apron pixel (== neighbour's first pixel), so
+		// adjacent landscape actors share identical heights at their shared seam vertex.
+		ResampleHeights(SrcHeightsMeters, SrcW_H_Padded, SrcH_H_Padded, ResampledHeights, LandscapeVerts, LandscapeVerts);
 		SrcHeightsMeters.Empty(); // free the high-res heightmap source
 
 		// Quantize to uint16 heightmap with the global Z scale.
@@ -2058,35 +2169,75 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 		return;
 	}
 
-	// Map existing MapboxLandscape_* actors by ChunkX,ChunkY parsed out of their name. The name format is
-	// MapboxLandscape_C{X}_{Y} (set by SpawnLandscapeForChunk); chunk indices in the current Chunks[] need
-	// to match for population to align.
-	TMap<FIntPoint, ALandscapeProxy*> ChunkToActor;
-	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	// Map existing parent MapboxLandscape_* actors by ChunkX,ChunkY parsed out of their name. Notes on
+	// what we match (and what we deliberately don't):
+	//
+	//   • Parent ALandscape — name prefix "MapboxLandscape_C{X}_{Y}". This is where we want splines to
+	//     live. The engine auto-distributes spline meshes from the parent into streaming-proxy-level
+	//     actors via GetStreamingSplinesComponentByLocation.
+	//
+	//   • Streaming proxies — name prefix "MapboxLandscapeProxy_C{X}_{Y}". DON'T match these here. If
+	//     we put splines on a proxy, the engine doesn't know how to associate them with the parent
+	//     landscape, and they end up at world origin (the proxy's local origin after partition is
+	//     different from its parent's). That's likely what produced the "splines at 0,0,0" report.
+	//
+	// The Cast<ALandscape>() filter excludes ALandscapeStreamingProxy because it's a subclass of
+	// ALandscapeProxy but not ALandscape.
+	TMap<FIntPoint, ALandscape*> ChunkToActor;
+	int32 RejectedProxies = 0;
+	for (TActorIterator<ALandscape> It(World); It; ++It)
 	{
-		ALandscapeProxy* L = *It;
+		ALandscape* L = *It;
 		if (!IsValid(L)) continue;
 		const FString Name = L->GetName();
+		// Require the exact "MapboxLandscape_C" prefix so we don't accidentally pick up the proxies
+		// (they're "MapboxLandscapeProxy_*") or unrelated landscapes.
+		if (!Name.StartsWith(TEXT("MapboxLandscape_C")))
+		{
+			continue;
+		}
 		// Parse "MapboxLandscape_C{X}_{Y}..." or "MapboxLandscape_C{X}_{Y}_UEDPIE_..." etc.
 		const int32 CIdx = Name.Find(TEXT("_C"));
-		if (CIdx == INDEX_NONE) continue;
 		const FString Tail = Name.Mid(CIdx + 2);
 		TArray<FString> Parts;
 		Tail.ParseIntoArray(Parts, TEXT("_"), /*bCullEmpty=*/true);
 		if (Parts.Num() < 2) continue;
 		const int32 CX = FCString::Atoi(*Parts[0]);
 		const int32 CY = FCString::Atoi(*Parts[1]);
-		ChunkToActor.Add(FIntPoint(CX, CY), L);
+		const FIntPoint Key(CX, CY);
+		ALandscape*& Slot = ChunkToActor.FindOrAdd(Key);
+		if (Slot != nullptr)
+		{
+			UE_LOG(LogMapbox, Warning, TEXT("Mapbox: duplicate ALandscape parent for chunk (%d,%d): '%s' and '%s'. Keeping the first."),
+				CX, CY, *Slot->GetActorLabel(), *L->GetActorLabel());
+			continue;
+		}
+		Slot = L;
+		UE_LOG(LogMapbox, Verbose, TEXT("Mapbox: matched chunk (%d,%d) -> '%s' at %s"),
+			CX, CY, *L->GetActorLabel(), *L->GetActorLocation().ToCompactString());
+	}
+	// For visibility: also report any streaming proxies we explicitly skipped.
+	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	{
+		ALandscapeProxy* P = *It;
+		if (!IsValid(P) || Cast<ALandscape>(P)) continue; // ALandscape already handled above
+		if (P->GetName().StartsWith(TEXT("MapboxLandscape"))) ++RejectedProxies;
+	}
+	if (RejectedProxies > 0)
+	{
+		UE_LOG(LogMapbox, Log, TEXT("Mapbox: skipped %d streaming proxy actor(s) when matching chunks (splines go on the parent ALandscape, not on proxies)."),
+			RejectedProxies);
 	}
 
 	if (ChunkToActor.IsEmpty())
 	{
 		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
-			TEXT("Mapbox: no MapboxLandscape_* actors found by name."),
-			TEXT("If you renamed the actors, rename one back so the populate can target them."));
+			TEXT("Mapbox: no parent MapboxLandscape_* actors found by name."),
+			TEXT("If you renamed the actors, rename one back so the populate can target them. NB: streaming proxies (MapboxLandscapeProxy_*) are intentionally skipped — splines must go on the parent ALandscape."));
 		FinishFetch();
 		return;
 	}
+	UE_LOG(LogMapbox, Log, TEXT("Mapbox: world-features populate matched %d parent landscape(s)."), ChunkToActor.Num());
 
 	const int32 TilesPerSide = FMath::Max(1, TilesPerLandscapeSide);
 	const double TileSideMeters = 156543.03 * FMath::Cos(FMath::DegreesToRadians(CenterLatitude)) / (1 << ResolvedZoom);
@@ -2108,9 +2259,14 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 		SlowTask.EnterProgressFrame(1.0f, FText::FromString(FString::Printf(
 			TEXT("Chunk (%d, %d)"), Chunk.ChunkX, Chunk.ChunkY)));
 
-		ALandscapeProxy** FoundActor = ChunkToActor.Find(FIntPoint(Chunk.ChunkX, Chunk.ChunkY));
-		if (!FoundActor || !IsValid(*FoundActor)) continue;
-		ALandscapeProxy* Landscape = *FoundActor;
+		ALandscape** FoundActor = ChunkToActor.Find(FIntPoint(Chunk.ChunkX, Chunk.ChunkY));
+		if (!FoundActor || !IsValid(*FoundActor))
+		{
+			UE_LOG(LogMapbox, Verbose, TEXT("Mapbox: no parent ALandscape for chunk (%d,%d); skipping."),
+				Chunk.ChunkX, Chunk.ChunkY);
+			continue;
+		}
+		ALandscape* Landscape = *FoundActor;
 
 		TArray<FCollectedRoadPolyline> CollectedRoads;
 
