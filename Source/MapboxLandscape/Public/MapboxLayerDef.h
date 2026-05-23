@@ -155,6 +155,11 @@ enum class EMapboxRoadClass : uint8
 	Steps        UMETA(DisplayName = "Steps (stairs)"),
 	MajorRail    UMETA(DisplayName = "Major Rail (mainline railway)"),
 	MinorRail    UMETA(DisplayName = "Minor Rail (yard, siding, light rail)"),
+	// Aeroway classes live in the Mapbox `aeroway` MVT layer, NOT `road`. The defaults
+	// for these classes populate MvtLayer="aeroway" automatically — see GetDefaultMvtLayerForClass.
+	Runway       UMETA(DisplayName = "Runway (paved aircraft strip)"),
+	Taxiway      UMETA(DisplayName = "Taxiway (aircraft taxi route)"),
+	Apron        UMETA(DisplayName = "Apron (aircraft parking area)"),
 	Custom       UMETA(DisplayName = "Custom (use the MvtClassMatches array below)")
 };
 
@@ -206,4 +211,10 @@ struct FMapboxRoadClassSettings
 	 *  these (case-insensitive). Returns an empty array for Custom — caller should fall back to the
 	 *  user-supplied MvtClassMatches in that case. */
 	static MAPBOXLANDSCAPE_API TArray<FString> GetDefaultMvtMatchesForClass(EMapboxRoadClass InClass);
+
+	/** Returns the MVT layer name that holds features of the given class — "aeroway" for
+	 *  runway/taxiway/apron, "road" for everything else. Used by ResetRoadClassesToDefaults so
+	 *  aeroway rows are pre-configured against the correct layer (the user can still override
+	 *  via the MvtLayer field). */
+	static MAPBOXLANDSCAPE_API FString GetDefaultMvtLayerForClass(EMapboxRoadClass InClass);
 };

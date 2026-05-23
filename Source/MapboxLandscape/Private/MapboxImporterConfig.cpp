@@ -207,19 +207,38 @@ TArray<FString> FMapboxRoadClassSettings::GetDefaultMvtMatchesForClass(EMapboxRo
 	case EMapboxRoadClass::Steps:       return { TEXT("steps") };
 	case EMapboxRoadClass::MajorRail:   return { TEXT("major_rail") };
 	case EMapboxRoadClass::MinorRail:   return { TEXT("minor_rail") };
+	case EMapboxRoadClass::Runway:      return { TEXT("runway") };
+	case EMapboxRoadClass::Taxiway:     return { TEXT("taxiway") };
+	case EMapboxRoadClass::Apron:       return { TEXT("apron") };
 	case EMapboxRoadClass::Custom:      return {};
 	default:                            return {};
 	}
 }
 
+FString FMapboxRoadClassSettings::GetDefaultMvtLayerForClass(EMapboxRoadClass InClass)
+{
+	switch (InClass)
+	{
+	case EMapboxRoadClass::Runway:
+	case EMapboxRoadClass::Taxiway:
+	case EMapboxRoadClass::Apron:
+		return TEXT("aeroway");
+	default:
+		return TEXT("road");
+	}
+}
+
 void UMapboxImporterConfig::ResetRoadClassesToDefaults()
 {
+	// MakeClass picks the correct MvtLayer per class automatically — aeroway entries get
+	// MvtLayer="aeroway" so they read from the right MVT layer without the user touching
+	// the advanced field.
 	auto MakeClass = [](EMapboxRoadClass C, float Width, float PaintWidth, FName PaintLayer)
 	{
 		FMapboxRoadClassSettings R;
 		R.Class = C;
 		R.bEnabled = true;
-		R.MvtLayer = TEXT("road");
+		R.MvtLayer = FMapboxRoadClassSettings::GetDefaultMvtLayerForClass(C);
 		R.MvtClassMatches.Reset(); // empty — Class dropdown drives matching
 		R.SplineWidthMeters = Width;
 		R.PaintWidthMeters = PaintWidth;
@@ -243,6 +262,12 @@ void UMapboxImporterConfig::ResetRoadClassesToDefaults()
 	RoadClasses.Add(MakeClass(EMapboxRoadClass::Track,        3.f,  5.f, TEXT("DrySoil")));
 	RoadClasses.Add(MakeClass(EMapboxRoadClass::MajorRail,    4.f,  6.f, NAME_None));
 	RoadClasses.Add(MakeClass(EMapboxRoadClass::MinorRail,    3.f,  5.f, NAME_None));
+	// Aeroways: runway width is genuinely 45 m (Cat-I commercial), 60 m for Cat-III.
+	// Taxiway is 18–23 m. Apron polygons are typically wider areas — left at 30 m so the
+	// spline-mesh sweep covers the apron centerlines that Mapbox encodes as lines.
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Runway,      45.f, 55.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Taxiway,     18.f, 22.f, TEXT("Sand")));
+	RoadClasses.Add(MakeClass(EMapboxRoadClass::Apron,       30.f, 35.f, TEXT("Sand")));
 
 #if WITH_EDITOR
 	PostEditChange();
