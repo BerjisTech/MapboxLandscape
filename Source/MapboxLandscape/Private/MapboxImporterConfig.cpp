@@ -1807,7 +1807,16 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 
 		// --- Decode metadata + satellite + parse vector for chunk sat tiles, then remove blobs.
 		const double MetersPerSrcPixel = TileSideMeters / 256.0;
-		const int32 LandscapeVerts = PickValidLandscapeSize(SrcW);
+
+		// Non-square chunks: trailing-edge chunks at the east/south of the import have
+		// TilesX != TilesY, so the landscape's vertex count must be sized per-axis. A
+		// single PickValidLandscapeSize(SrcW) for both axes (the previous bug) created a
+		// SQUARE landscape sized to the X-axis only, leaving 3*TileWorldCm Y gaps between
+		// consecutive east-edge chunks — the "floating tile" rendering bug. XYScale is
+		// constant per axis by construction (PickValidLandscapeSize keeps cells the same
+		// size per source pixel), so the actor's transform stays uniform.
+		const int32 LandscapeVertsX = PickValidLandscapeSize(SrcW);
+		const int32 LandscapeVertsY = PickValidLandscapeSize(SrcH);
 
 		// Allocate per-active-layer vector masks at LANDSCAPE resolution (not source).
 		VectorMasksAtLandscapeRes.SetNum(MapboxLayers.Num());
@@ -1815,7 +1824,7 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		{
 			if (MapboxLayers[i].MatchMode != EMapboxLayerMatchMode::Color && !MapboxLayers[i].VectorFilters.IsEmpty())
 			{
-				VectorMasksAtLandscapeRes[i].SetNumZeroed(LandscapeVerts * LandscapeVerts);
+				VectorMasksAtLandscapeRes[i].SetNumZeroed(LandscapeVertsX * LandscapeVertsY);
 			}
 			else if (VectorMasksAtLandscapeRes[i].Num() > 0)
 			{
@@ -1823,9 +1832,11 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			}
 		}
 
-		// Pixel-to-landscape scale for vector raster (one sat tile -> LandscapeVerts/TilesX cells).
-		// Each chunk sat tile occupies LandscapePxPerTile pixels on the landscape mask.
-		const double LandscapePxPerSatTile = (double)LandscapeVerts / FMath::Max(1, Chunk.TilesX);
+		// Pixel-to-landscape scale for vector raster — separate per axis since the chunk
+		// may be non-square. Sat tiles are 1:1 with chunk tile grid, so each sat tile maps
+		// to (LandscapeVertsX/TilesX, LandscapeVertsY/TilesY) cells of the landscape mask.
+		const double LandscapePxPerSatTileX = (double)LandscapeVertsX / FMath::Max(1, Chunk.TilesX);
+		const double LandscapePxPerSatTileY = (double)LandscapeVertsY / FMath::Max(1, Chunk.TilesY);
 
 		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
 		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
@@ -1891,9 +1902,14 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 					TArray<MapboxMvt::FLayer> MvtLayers;
 					if (MapboxMvt::ParseTile(Blob->Bytes, MvtLayers))
 					{
-						const double LandscapeBaseX = tx * LandscapePxPerSatTile;
-						const double LandscapeBaseY = ty * LandscapePxPerSatTile;
-						const double LandscapeMetersPerPixel = (TileSideMeters * Chunk.TilesX) / FMath::Max(1, LandscapeVerts);
+						const double LandscapeBaseX = tx * LandscapePxPerSatTileX;
+						const double LandscapeBaseY = ty * LandscapePxPerSatTileY;
+						// Per-axis meters/pixel for line-width brush sizing. By construction
+						// these are equal (PickValidLandscapeSize keeps cell density constant),
+						// but compute explicitly so non-square chunks rasterize correctly.
+						const double LandscapeMetersPerPixelX = (TileSideMeters * Chunk.TilesX) / FMath::Max(1, LandscapeVertsX);
+						const double LandscapeMetersPerPixelY = (TileSideMeters * Chunk.TilesY) / FMath::Max(1, LandscapeVertsY);
+						const double LandscapeMetersPerPixel = FMath::Min(LandscapeMetersPerPixelX, LandscapeMetersPerPixelY);
 
 						for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
 						{
@@ -1906,8 +1922,11 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 								{
 									if (!Filter.MvtLayer.Equals(MvtLayer.Name, ESearchCase::IgnoreCase)) continue;
 
-									// MVT extent->landscape-mask scale: one tile's extent maps to LandscapePxPerSatTile pixels.
-									const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
+									// MVT extent->landscape-mask scale: per-axis since the chunk
+									// may be non-square. ExtentToLandscapeX == ExtentToLandscapeY
+									// in practice (sat tiles are square) but kept distinct for safety.
+									const double ExtentToLandscapeX = LandscapePxPerSatTileX / FMath::Max(1.0, (double)MvtLayer.Extent);
+									const double ExtentToLandscapeY = LandscapePxPerSatTileY / FMath::Max(1.0, (double)MvtLayer.Extent);
 									const int32 BrushRadius = FMath::Max(0,
 										FMath::CeilToInt(Filter.LineWidthMeters / FMath::Max(LandscapeMetersPerPixel, 0.01) / 2.0));
 
@@ -1920,13 +1939,13 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 											for (const TArray<FVector2D>& Line : Feature.Geometry)
 											{
 												if (Line.Num() < 2) continue;
-												int32 PrevX = (int32)(LandscapeBaseX + Line[0].X * ExtentToLandscape);
-												int32 PrevY = (int32)(LandscapeBaseY + Line[0].Y * ExtentToLandscape);
+												int32 PrevX = (int32)(LandscapeBaseX + Line[0].X * ExtentToLandscapeX);
+												int32 PrevY = (int32)(LandscapeBaseY + Line[0].Y * ExtentToLandscapeY);
 												for (int32 p = 1; p < Line.Num(); ++p)
 												{
-													const int32 CurX = (int32)(LandscapeBaseX + Line[p].X * ExtentToLandscape);
-													const int32 CurY = (int32)(LandscapeBaseY + Line[p].Y * ExtentToLandscape);
-													RasterLine(VectorMasksAtLandscapeRes[LayerIdx], LandscapeVerts, LandscapeVerts,
+													const int32 CurX = (int32)(LandscapeBaseX + Line[p].X * ExtentToLandscapeX);
+													const int32 CurY = (int32)(LandscapeBaseY + Line[p].Y * ExtentToLandscapeY);
+													RasterLine(VectorMasksAtLandscapeRes[LayerIdx], LandscapeVertsX, LandscapeVertsY,
 														PrevX, PrevY, CurX, CurY, BrushRadius);
 													PrevX = CurX; PrevY = CurY;
 												}
@@ -1940,11 +1959,11 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 												Transformed.Reserve(Ring.Num());
 												for (const FVector2D& P : Ring)
 												{
-													Transformed.Add(FVector2D(LandscapeBaseX + P.X * ExtentToLandscape,
-														LandscapeBaseY + P.Y * ExtentToLandscape));
+													Transformed.Add(FVector2D(LandscapeBaseX + P.X * ExtentToLandscapeX,
+														LandscapeBaseY + P.Y * ExtentToLandscapeY));
 												}
 												RasterPolygonRing(VectorMasksAtLandscapeRes[LayerIdx],
-													LandscapeVerts, LandscapeVerts, Transformed);
+													LandscapeVertsX, LandscapeVertsY, Transformed);
 											}
 										}
 									}
@@ -1967,11 +1986,11 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		// Pass the PADDED dimensions: the resampler's (SrcW-1)/(DstW-1) mapping then places the
 		// destination's last vertex at the appended apron pixel (== neighbour's first pixel), so
 		// adjacent landscape actors share identical heights at their shared seam vertex.
-		ResampleHeights(SrcHeightsMeters, SrcW_H_Padded, SrcH_H_Padded, ResampledHeights, LandscapeVerts, LandscapeVerts);
+		ResampleHeights(SrcHeightsMeters, SrcW_H_Padded, SrcH_H_Padded, ResampledHeights, LandscapeVertsX, LandscapeVertsY);
 		SrcHeightsMeters.Empty(); // free the high-res heightmap source
 
 		// Quantize to uint16 heightmap with the global Z scale.
-		Heightmap.SetNumUninitialized(LandscapeVerts * LandscapeVerts);
+		Heightmap.SetNumUninitialized(LandscapeVertsX * LandscapeVertsY);
 		for (int32 i = 0; i < ResampledHeights.Num(); ++i)
 		{
 			const float WorldZcm = (ResampledHeights[i] - BaselineMeters) * 100.f * ZExaggeration;
@@ -1983,12 +2002,12 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 		// --- Resample metadata for color classification, then drop the source.
 		if (bHasColorLayer)
 		{
-			ResampleColors(SrcMetadata, SrcW, SrcH, ResampledMeta, LandscapeVerts, LandscapeVerts);
+			ResampleColors(SrcMetadata, SrcW, SrcH, ResampledMeta, LandscapeVertsX, LandscapeVertsY);
 			SrcMetadata.Empty();
 		}
 
 		// --- Compute WinnerLayer/Priority across color + vector candidates.
-		const int32 PixelCount = LandscapeVerts * LandscapeVerts;
+		const int32 PixelCount = LandscapeVertsX * LandscapeVertsY;
 		WinnerLayer.Init(INDEX_NONE, PixelCount);
 		WinnerPriority.Init(-1, PixelCount);
 
@@ -2092,10 +2111,15 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 			SrcSatellite.Empty();
 		}
 
-		const double WorldSizePerLandscapeCm = SrcW * WorldCmPerSourcePixel;
+		// Per-axis chunk world sizes so non-square trailing chunks render at their
+		// true extent (otherwise the east-edge column collapses to TilesX × TilesX
+		// square landscapes with TilesY-TilesX tiles of gap between them).
+		const double WorldSizeXCm = SrcW * WorldCmPerSourcePixel;
+		const double WorldSizeYCm = SrcH * WorldCmPerSourcePixel;
 		ALandscapeProxy* Landscape = SpawnLandscapeForChunk(
 			Chunk, Heightmap, LayerWeights, SatTexture,
-			(double)LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale,
+			(double)LandscapeVertsX, (double)LandscapeVertsY,
+			WorldSizeXCm, WorldSizeYCm, LandscapeZScale,
 			TileWorldCm, TotalWorldX, TotalWorldY);
 
 		if (Landscape)
@@ -2105,8 +2129,8 @@ void UMapboxImporterConfig::OnAllTilesDownloaded()
 
 			// PCG + HISM scatter share the heightmap so they don't need physics traces.
 			SpawnPCGForLandscape(Landscape, SatTexture, LayerWeights, Heightmap,
-				LandscapeVerts, WorldSizePerLandscapeCm, LandscapeZScale);
-			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizePerLandscapeCm);
+				LandscapeVertsX, LandscapeVertsY, WorldSizeXCm, WorldSizeYCm, LandscapeZScale);
+			SpawnSatelliteDecal(Landscape, SatTexture, WorldSizeXCm, WorldSizeYCm);
 		}
 
 		// Release everything before the next iteration. Empty() returns the backing buffer to the allocator
@@ -2362,8 +2386,10 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 	const TArray<uint16>& HeightData,
 	const TMap<FName, TArray<uint8>>& LayerWeights,
 	UTexture2D* SatelliteTexture,
-	double LandscapeVertsPerSide,
-	double WorldSizePerLandscapeCm,
+	double LandscapeVertsXPerSide,
+	double LandscapeVertsYPerSide,
+	double WorldSizeXCm,
+	double WorldSizeYCm,
 	double LandscapeZScale,
 	double TileWorldCm,
 	double TotalWorldX,
@@ -2374,8 +2400,10 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 
 	const int32 SectionSize = 63;
 	const int32 SectionsPerComponent = 1;
-	const int32 Verts = (int32)LandscapeVertsPerSide;
-	const int32 ComponentsPerSide = (Verts - 1) / SectionSize;
+	const int32 VertsX = (int32)LandscapeVertsXPerSide;
+	const int32 VertsY = (int32)LandscapeVertsYPerSide;
+	const int32 ComponentsPerSideX = (VertsX - 1) / SectionSize;
+	const int32 ComponentsPerSideY = (VertsY - 1) / SectionSize;
 
 	// Per-chunk standalone ALandscape. Tried shared LandscapeGuid + ALandscapeStreamingProxy children for a
 	// parent/proxy hierarchy — but UE5.7 packs up to 8 LandscapeComponents per heightmap texture
@@ -2400,8 +2428,13 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 	// fetch finishes — that command does the SplitHeightmap conversion properly and yields streaming proxies.
 
 	// Position chunk by its actual tile offset (handles uneven trailing chunks correctly)
-	// and center the whole area on the actor's pivot.
-	const double XYScale = WorldSizePerLandscapeCm / (LandscapeVertsPerSide - 1);
+	// and center the whole area on the actor's pivot. XYScale is identical on both axes
+	// by construction (PickValidLandscapeSize maintains constant cell density per source
+	// pixel) — guarded below to surface drift if PickValidLandscapeSize ever changes.
+	const double XYScale = WorldSizeXCm / (LandscapeVertsXPerSide - 1);
+	checkf(FMath::IsNearlyEqual(XYScale, WorldSizeYCm / (LandscapeVertsYPerSide - 1), 1e-6),
+		TEXT("MapboxLandscape: non-uniform XY scale in chunk (%d,%d) — Tx=%d Ty=%d"),
+		Chunk.ChunkX, Chunk.ChunkY, Chunk.TilesX, Chunk.TilesY);
 	const double LocalX = (Chunk.MinTileX - MinTileX) * TileWorldCm - TotalWorldX * 0.5;
 	const double LocalY = (Chunk.MinTileY - MinTileY) * TileWorldCm - TotalWorldY * 0.5;
 	const FVector ChunkOrigin = ImportOrigin + FVector(LocalX, LocalY, 0.0);
@@ -2417,8 +2450,13 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 	}
 	else if (SatelliteMode == EMapboxSatelliteMode::BlendIntoMaterial)
 	{
+		// Material UV currently uses a single scalar LandscapeWorldSize — pass the max so
+		// non-square chunks tile the texture once across the longer axis (slight aspect
+		// stretch on the shorter axis is acceptable; a vector-param fix is on the
+		// release-polish backlog in CHECKLIST.md).
+		const double WorldSizeForMaterial = FMath::Max(WorldSizeXCm, WorldSizeYCm);
 		UMaterialInstanceConstant* MIC = CreateMaterialInstanceForChunk(Master, SatelliteTexture,
-			Chunk.ChunkX, Chunk.ChunkY, ChunkOrigin, WorldSizePerLandscapeCm);
+			Chunk.ChunkX, Chunk.ChunkY, ChunkOrigin, WorldSizeForMaterial);
 		Landscape->LandscapeMaterial = MIC ? Cast<UMaterialInterface>(MIC) : Master;
 	}
 	else
@@ -2462,7 +2500,7 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 	Landscape->Import(
 		LandscapeGuid,
 		0, 0,
-		Verts - 1, Verts - 1,
+		VertsX - 1, VertsY - 1,
 		SectionsPerComponent, SectionSize,
 		HeightDataPerLayers,
 		TEXT(""),
@@ -2471,7 +2509,7 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 		TArrayView<const FLandscapeLayer>());
 
 	Landscape->StaticLightingLOD = (int8)FMath::DivideAndRoundUp(
-		(int32)FMath::CeilLogTwo((Verts * Verts) / (2048 * 2048) + 1), 2);
+		(int32)FMath::CeilLogTwo((VertsX * VertsY) / (2048 * 2048) + 1), 2);
 
 	ULandscapeInfo* LandscapeInfo = Landscape->CreateLandscapeInfo();
 	if (LandscapeInfo)
@@ -2492,18 +2530,21 @@ ALandscapeProxy* UMapboxImporterConfig::SpawnLandscapeForChunk(const FLandscapeC
 // Sample world Z (cm) directly from the heightmap. This bypasses the landscape collision system,
 // which avoids paying tens of millions of LineTraceSingleByChannel calls when scattering grass etc.
 // Format: Heightmap[i] in [0..65535], 32768 = baseline. World Z = Origin.Z + (val - 32768) * (ZScale / 128).
-static FORCEINLINE double HeightmapWorldZ(const TArray<uint16>& Heightmap, int32 LandscapeVerts,
+// VertsX is the row stride; non-square chunks (trailing east/south edges) need it explicitly so
+// indexing doesn't run off the row.
+static FORCEINLINE double HeightmapWorldZ(const TArray<uint16>& Heightmap, int32 VertsX, int32 VertsY,
 	int32 vx, int32 vy, double LandscapeZScale, double OriginZ)
 {
-	const int32 cx = FMath::Clamp(vx, 0, LandscapeVerts - 1);
-	const int32 cy = FMath::Clamp(vy, 0, LandscapeVerts - 1);
-	const int32 H = (int32)Heightmap[cy * LandscapeVerts + cx];
+	const int32 cx = FMath::Clamp(vx, 0, VertsX - 1);
+	const int32 cy = FMath::Clamp(vy, 0, VertsY - 1);
+	const int32 H = (int32)Heightmap[cy * VertsX + cx];
 	return OriginZ + (double)(H - 32768) * LandscapeZScale / 128.0;
 }
 
 void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTexture2D* /*SatelliteTexture*/,
 	const TMap<FName, TArray<uint8>>& LayerWeights, const TArray<uint16>& Heightmap,
-	int32 LandscapeVerts, double WorldSizePerLandscapeCm, double LandscapeZScale)
+	int32 LandscapeVertsX, int32 LandscapeVertsY,
+	double WorldSizeXCm, double WorldSizeYCm, double LandscapeZScale)
 {
 	if (!Landscape) return;
 
@@ -2527,7 +2568,9 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 	// HISM scatter: respects per-layer weight maps so trees only land on forest etc.
 	// Uses the heightmap directly (no line traces) and a meters-based stride floor.
 	const FVector LandscapeOrigin = Landscape->GetActorLocation();
-	const double CmPerVert = WorldSizePerLandscapeCm / FMath::Max(1, LandscapeVerts - 1);
+	// CmPerVert is identical on both axes by construction (PickValidLandscapeSize keeps
+	// cell density constant), so picking either gives the same stride math.
+	const double CmPerVert = WorldSizeXCm / FMath::Max(1, LandscapeVertsX - 1);
 	const double MetersPerVert = CmPerVert / 100.0;
 
 	for (const FMapboxLayerDef& L : MapboxLayers)
@@ -2546,10 +2589,10 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 
 		// Quick pre-filter: if no sample at this stride has weight, skip the whole layer for this landscape.
 		bool bAnyHits = false;
-		for (int32 vy = 0; vy < LandscapeVerts && !bAnyHits; vy += SampleStride)
-		for (int32 vx = 0; vx < LandscapeVerts && !bAnyHits; vx += SampleStride)
+		for (int32 vy = 0; vy < LandscapeVertsY && !bAnyHits; vy += SampleStride)
+		for (int32 vx = 0; vx < LandscapeVertsX && !bAnyHits; vx += SampleStride)
 		{
-			if (Weights[vy * LandscapeVerts + vx] >= 128) bAnyHits = true;
+			if (Weights[vy * LandscapeVertsX + vx] >= 128) bAnyHits = true;
 		}
 		if (!bAnyHits) continue;
 
@@ -2582,18 +2625,18 @@ void UMapboxImporterConfig::SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTe
 		const int32 MaxInstances = FMath::Max(100, L.ScatterMaxInstancesPerLandscape);
 		int32 PlacedCount = 0;
 
-		for (int32 vy = 0; vy < LandscapeVerts && PlacedCount < MaxInstances; vy += SampleStride)
+		for (int32 vy = 0; vy < LandscapeVertsY && PlacedCount < MaxInstances; vy += SampleStride)
 		{
-			for (int32 vx = 0; vx < LandscapeVerts && PlacedCount < MaxInstances; vx += SampleStride)
+			for (int32 vx = 0; vx < LandscapeVertsX && PlacedCount < MaxInstances; vx += SampleStride)
 			{
-				const uint8 W = Weights[vy * LandscapeVerts + vx];
+				const uint8 W = Weights[vy * LandscapeVertsX + vx];
 				if (W < 128) continue; // require majority weight
 
 				const double Jx = (vx + Rng.FRandRange(-0.4, 0.4)) * CmPerVert;
 				const double Jy = (vy + Rng.FRandRange(-0.4, 0.4)) * CmPerVert;
 				const double WorldX = LandscapeOrigin.X + Jx;
 				const double WorldY = LandscapeOrigin.Y + Jy;
-				const double WorldZ = HeightmapWorldZ(Heightmap, LandscapeVerts, vx, vy, LandscapeZScale, LandscapeOrigin.Z);
+				const double WorldZ = HeightmapWorldZ(Heightmap, LandscapeVertsX, LandscapeVertsY, vx, vy, LandscapeZScale, LandscapeOrigin.Z);
 
 				const float ScaleS = Rng.FRandRange(L.ScatterMinScale, L.ScatterMaxScale);
 				const float Yaw = L.bRandomYaw ? Rng.FRandRange(0.f, 360.f) : 0.f;
@@ -2920,7 +2963,8 @@ void UMapboxImporterConfig::ConvertGeneratedLandscapesToStreaming()
 #endif
 }
 
-void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture, double WorldSizePerLandscapeCm)
+void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
+	double WorldSizeXCm, double WorldSizeYCm)
 {
 	if (SatelliteMode != EMapboxSatelliteMode::OverlayDecal) return;
 	if (!Landscape || !SatelliteTexture) return;
@@ -2959,7 +3003,12 @@ void UMapboxImporterConfig::SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTex
 
 	if (UDecalComponent* DC = Decal->GetDecal())
 	{
-		DC->DecalSize = FVector(ProjectionDepth * 0.5, WorldSizePerLandscapeCm * 0.5, WorldSizePerLandscapeCm * 0.5);
+		// DecalSize is a half-extent (UE convention). The decal's pre-rotated component
+		// has X = projection direction (downward), Y = world-Y footprint, Z = world-X
+		// footprint — so the chunk's WorldSizeYCm goes into Y and WorldSizeXCm goes into Z.
+		// Using per-axis world sizes here is what stops trailing chunks from getting a
+		// satellite decal half the size they should.
+		DC->DecalSize = FVector(ProjectionDepth * 0.5, WorldSizeYCm * 0.5, WorldSizeXCm * 0.5);
 		DC->SetDecalMaterial(MID);
 		DC->SortOrder = 0;
 	}

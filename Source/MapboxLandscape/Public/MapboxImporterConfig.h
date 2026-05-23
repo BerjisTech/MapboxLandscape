@@ -237,12 +237,20 @@ private:
 		int32 ChunkX, int32 ChunkY, FVector LandscapeOriginCm, double LandscapeWorldSizeCm) const;
 	UPCGGraphInterface* GetOrGenerateScatterGraph();
 
+	// Per-axis vertex counts and world sizes: trailing-edge chunks (east / south of the
+	// import region) have TilesX != TilesY, so a single "per side" dim would either leave
+	// gaps (too small in Y) or overlap neighbours (too large in X). See the chunk loop in
+	// MapboxImporterConfig.cpp for the matching VertsX/VertsY/WorldSizeXCm/WorldSizeYCm
+	// computation and docs/leakage-defense.md... oops, see the floating-tile fix commit
+	// in this repo.
 	ALandscapeProxy* SpawnLandscapeForChunk(const FLandscapeChunk& Chunk,
 	                                        const TArray<uint16>& HeightData,
 	                                        const TMap<FName, TArray<uint8>>& LayerWeights,
 	                                        UTexture2D* SatelliteTexture,
-	                                        double LandscapeVertsPerSide,
-	                                        double WorldSizePerLandscapeCm,
+	                                        double LandscapeVertsXPerSide,
+	                                        double LandscapeVertsYPerSide,
+	                                        double WorldSizeXCm,
+	                                        double WorldSizeYCm,
 	                                        double LandscapeZScale,
 	                                        double TileWorldCm,
 	                                        double TotalWorldX,
@@ -251,12 +259,14 @@ private:
 	void SpawnPCGForLandscape(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
 	                          const TMap<FName, TArray<uint8>>& LayerWeights,
 	                          const TArray<uint16>& Heightmap,
-	                          int32 LandscapeVerts,
-	                          double WorldSizePerLandscapeCm,
+	                          int32 LandscapeVertsX,
+	                          int32 LandscapeVertsY,
+	                          double WorldSizeXCm,
+	                          double WorldSizeYCm,
 	                          double LandscapeZScale);
 
 	void SpawnSatelliteDecal(ALandscapeProxy* Landscape, UTexture2D* SatelliteTexture,
-	                         double WorldSizePerLandscapeCm);
+	                         double WorldSizeXCm, double WorldSizeYCm);
 
 	/** Internal: partition a single ALandscape into WP streaming proxies. Called by the public batch action;
 	 *  not for direct use because it doesn't drain the texture compile queue. No-op outside a WP world. */
