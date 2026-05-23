@@ -40,6 +40,10 @@ public class MapboxLandscape : ModuleRules
 			"RenderCore",
 			"RHI",
 			"PCG",
+			// ProceduralMeshComponent powers the world-features pipeline for water bodies
+			// and extruded buildings (FGeomTools2D triangulates the footprint, PMC renders
+			// the resulting verts). Lives in /Engine/Plugins/Runtime/ProceduralMeshComponent.
+			"ProceduralMeshComponent",
 		});
 	}
 }

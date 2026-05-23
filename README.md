@@ -52,6 +52,20 @@ The Importer is a dockable panel — drag it anywhere. There's no actor to place
 
 Every field has a tooltip. Hover for details and units.
 
+## World features beyond terrain
+
+After the landscape itself is fetched, **Tools → Mapbox Landscape → Open Landscape Importer → Populate World Features** drops three extra layers of geometry on top of the existing landscapes:
+
+| Feature | What you get | Source |
+|---|---|---|
+| **Roads + Aeroways** | `ULandscapeSplineSegment` swept along OSM road / runway / taxiway centerlines, with per-class width and paint-layer settings. Includes motorway through footway, two rail classes, runway/taxiway/apron. | Mapbox `road` + `aeroway` vector layers. |
+| **Water bodies** | Flat-shaded `UProceduralMeshComponent` planes per lake / river / coast polygon, at the average terrain Z under the footprint + a configurable offset. Bring your own water material (e.g. Water plugin's `M_Water_LakeRiver`). | Mapbox `water` vector layer. |
+| **Buildings** | Extruded `UProceduralMeshComponent` per footprint with walls + flat roof. Heights come from the MVT `height` attribute (with `min_height` for tower-on-podium); falls back to a configurable default for tilesets that don't expose 3-D data. Footprints below `MinBuildingFootprintSquareMeters` are filtered out as OSM noise. | Mapbox `building` vector layer. |
+
+Tick or untick `Populate Roads / Water / Buildings` independently. Each feature type has its own tunables in the importer panel under `Mapbox|World Features|*`.
+
+Vegetation polygons (`landuse=wood / forest / park / farmland`) already feed the standard landscape weight-mask + HISM scatter pipeline — assign meshes to the `Forest` / `Park` layers under `Mapbox|Layers` and the existing scatter handles density and placement.
+
 ## Layers — what the plugin classifies and how
 
 Each `FMapboxLayerDef` defines one landscape weight-map channel. Each one has a `MatchMode`:

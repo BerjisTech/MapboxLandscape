@@ -14,6 +14,9 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
+#include "GeomTools.h"                       // FGeomTools2D::TriangulatePoly for water + buildings
+#include "Materials/MaterialInterface.h"
+#include "ProceduralMeshComponent.h"          // Water-plane + building extrusions
 #include "EngineUtils.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "HAL/PlatformMemory.h"
@@ -889,11 +892,11 @@ void UMapboxImporterConfig::PopulateWorldFeatures()
 	}
 
 	// Validate at least one feature type is enabled.
-	if (!bPopulateRoads)
+	if (!bPopulateRoads && !bPopulateWater && !bPopulateBuildings)
 	{
 		MapboxUI::Notify(MapboxUI::ESeverity::Warning,
 			TEXT("Mapbox: no world feature types are enabled."),
-			TEXT("Tick at least one of: Populate Roads (more types coming)."));
+			TEXT("Tick at least one of: Populate Roads, Populate Water, Populate Buildings."));
 		return;
 	}
 
@@ -2302,6 +2305,10 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 
 	int32 ChunksWithRoads = 0;
 	int32 TotalPolylines = 0;
+	int32 ChunksWithWater = 0;
+	int32 TotalWaterPolygons = 0;
+	int32 ChunksWithBuildings = 0;
+	int32 TotalBuildings = 0;
 
 	for (const FLandscapeChunk& Chunk : Chunks)
 	{
@@ -2318,8 +2325,10 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 		ALandscape* Landscape = *FoundActor;
 
 		TArray<FCollectedRoadPolyline> CollectedRoads;
+		TArray<FCollectedPolygon> CollectedWaters;
+		TArray<FCollectedPolygon> CollectedBuildings;
 
-		// Re-parse vector tiles for this chunk and collect road polylines.
+		// Re-parse vector tiles for this chunk and collect roads / water polygons / building polygons.
 		for (int32 ty = 0; ty < Chunk.TilesY; ++ty)
 		for (int32 tx = 0; tx < Chunk.TilesX; ++tx)
 		{
@@ -2334,6 +2343,32 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 
 			const double LandscapeBaseX = tx * LandscapePxPerSatTile;
 			const double LandscapeBaseY = ty * LandscapePxPerSatTile;
+
+			// Helper: convert one MVT polygon feature's geometry (which is a flat list of rings —
+			// outer first, holes after; sign of signed-area distinguishes them) into landscape-pixel
+			// space. MVT 2.1 spec: clockwise = outer ring, counter-clockwise = hole. We don't
+			// preserve hole topology here because v1 just triangulates the outer ring; holes get
+			// dropped silently. Mapbox water/building polygons at the zooms we use are rarely
+			// multi-hole (parks like Central Park or lakes with islands are the rare exception).
+			auto MapRingsToLandscape = [&](const TArray<TArray<FVector2D>>& SrcRings, double ExtentToLandscape) -> TArray<TArray<FVector2D>>
+			{
+				TArray<TArray<FVector2D>> Out;
+				Out.Reserve(SrcRings.Num());
+				for (const TArray<FVector2D>& Ring : SrcRings)
+				{
+					if (Ring.Num() < 3) continue;
+					TArray<FVector2D> Transformed;
+					Transformed.Reserve(Ring.Num());
+					for (const FVector2D& P : Ring)
+					{
+						Transformed.Add(FVector2D(
+							LandscapeBaseX + P.X * ExtentToLandscape,
+							LandscapeBaseY + P.Y * ExtentToLandscape));
+					}
+					Out.Add(MoveTemp(Transformed));
+				}
+				return Out;
+			};
 
 			if (bPopulateRoads)
 			{
@@ -2384,24 +2419,92 @@ void UMapboxImporterConfig::ProcessWorldFeaturesDownloaded()
 				}
 			}
 
+			// Water polygons + Building polygons. Both live in dedicated MVT layers in Mapbox
+			// Streets v8 ("water" and "building"). Each polygon Feature.Geometry holds a flat
+			// list of rings — we keep all of them but only the outer ring is triangulated
+			// downstream (see GenerateWater/BuildingMeshesForChunk).
+			for (const MapboxMvt::FLayer& MvtLayer : MvtLayers)
+			{
+				const double ExtentToLandscape = LandscapePxPerSatTile / FMath::Max(1.0, (double)MvtLayer.Extent);
+
+				if (bPopulateWater && MvtLayer.Name.Equals(TEXT("water"), ESearchCase::IgnoreCase))
+				{
+					for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+					{
+						if (Feature.Type != MapboxMvt::EFeatureType::Polygon) continue;
+						FCollectedPolygon Poly;
+						Poly.Rings = MapRingsToLandscape(Feature.Geometry, ExtentToLandscape);
+						if (Poly.Rings.Num() > 0) CollectedWaters.Add(MoveTemp(Poly));
+					}
+				}
+
+				if (bPopulateBuildings && MvtLayer.Name.Equals(TEXT("building"), ESearchCase::IgnoreCase))
+				{
+					for (const MapboxMvt::FFeature& Feature : MvtLayer.Features)
+					{
+						if (Feature.Type != MapboxMvt::EFeatureType::Polygon) continue;
+						FCollectedPolygon Poly;
+						Poly.Rings = MapRingsToLandscape(Feature.Geometry, ExtentToLandscape);
+						if (Poly.Rings.Num() == 0) continue;
+
+						// MVT `height` (in meters) is the canonical building-height property in
+						// Mapbox Streets v8. `min_height` is for tower-on-podium / overpasses
+						// (a building section that starts above ground). Both are strings in
+						// the parsed Properties map; parse defensively and fall back to -1
+						// (sentinel = "use the user's DefaultBuildingHeightMeters").
+						if (const FString* HStr = Feature.Properties.Find(TEXT("height")))
+						{
+							const float H = FCString::Atof(**HStr);
+							if (H > 0.f) Poly.HeightMeters = H;
+						}
+						if (const FString* MinStr = Feature.Properties.Find(TEXT("min_height")))
+						{
+							const float MinH = FCString::Atof(**MinStr);
+							if (MinH > 0.f) Poly.MinHeightMeters = MinH;
+						}
+						CollectedBuildings.Add(MoveTemp(Poly));
+					}
+				}
+			}
+
 			CompletedBlobs.Remove(VKey);
 		}
 
+		// Use the landscape's actual transform — it knows where it is in the world. Shared
+		// across roads/water/buildings so all three live in the same coordinate frame.
+		const FVector ChunkOrigin = Landscape->GetActorLocation();
+		const FVector ActorScale = Landscape->GetActorScale3D();
+
 		if (bPopulateRoads && !CollectedRoads.IsEmpty())
 		{
-			// Use the landscape's actual transform — it knows where it is in the world.
-			const FVector ChunkOrigin = Landscape->GetActorLocation();
-			const FVector ActorScale = Landscape->GetActorScale3D();
 			TotalPolylines += CollectedRoads.Num();
 			GenerateRoadSplinesForChunk(Landscape, CollectedRoads, LandscapeVerts,
 				WorldSizePerLandscapeCm, ActorScale.Z, ChunkOrigin);
 			++ChunksWithRoads;
 		}
+
+		if (bPopulateWater && !CollectedWaters.IsEmpty())
+		{
+			TotalWaterPolygons += CollectedWaters.Num();
+			GenerateWaterMeshesForChunk(Landscape, CollectedWaters, LandscapeVerts,
+				WorldSizePerLandscapeCm, ChunkOrigin);
+			++ChunksWithWater;
+		}
+
+		if (bPopulateBuildings && !CollectedBuildings.IsEmpty())
+		{
+			TotalBuildings += CollectedBuildings.Num();
+			GenerateBuildingMeshesForChunk(Landscape, CollectedBuildings, LandscapeVerts,
+				WorldSizePerLandscapeCm, ChunkOrigin);
+			++ChunksWithBuildings;
+		}
 	}
 
 	MapboxUI::Notify(MapboxUI::ESeverity::Success,
-		FString::Printf(TEXT("Mapbox: populated %d polyline(s) across %d landscape(s)."),
-			TotalPolylines, ChunksWithRoads));
+		FString::Printf(TEXT("Mapbox: roads %d in %d landscape(s); water %d in %d; buildings %d in %d."),
+			TotalPolylines, ChunksWithRoads,
+			TotalWaterPolygons, ChunksWithWater,
+			TotalBuildings, ChunksWithBuildings));
 
 	FinishFetch();
 #endif
@@ -3057,4 +3160,319 @@ void UMapboxImporterConfig::FinishFetch()
 	PendingDownloadQueue.Reset();
 	CompletedBlobs.Reset();
 	FetchMode = EFetchMode::Landscape;
+}
+
+// ----- Water + Buildings (procedural mesh generators) ------------------------
+
+namespace
+{
+	// Vertical world-Z sampler shared by water + buildings. Falls back to ChunkOrigin.Z
+	// if the trace misses (e.g. polygon vertex sits over an unfetched neighbour-chunk
+	// pixel). Mirrors the lambda used in GenerateRoadSplinesForChunk; pulled out so both
+	// new generators can share it without re-defining.
+	static double SampleWorldZAtXY(UWorld* World, const FVector& ChunkOrigin, double WorldX, double WorldY)
+	{
+		if (!World) return ChunkOrigin.Z;
+		const FVector Start(WorldX, WorldY, ChunkOrigin.Z + 200000.0);
+		const FVector End  (WorldX, WorldY, ChunkOrigin.Z - 200000.0);
+		FHitResult Hit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(MapboxWorldFeatureZSample), /*bTraceComplex=*/false);
+		World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, Params);
+		return Hit.bBlockingHit ? Hit.ImpactPoint.Z : ChunkOrigin.Z;
+	}
+
+	// Signed area of a 2D ring (positive = CCW, negative = CW). Used to (a) reject
+	// degenerate polygons before triangulation and (b) compute footprint area for the
+	// building min-area filter.
+	static double SignedAreaPx2(const TArray<FVector2D>& Ring)
+	{
+		double A = 0.0;
+		const int32 N = Ring.Num();
+		for (int32 i = 0, j = N - 1; i < N; j = i++)
+		{
+			A += (Ring[j].X * Ring[i].Y) - (Ring[i].X * Ring[j].Y);
+		}
+		return A * 0.5;
+	}
+
+	// Triangulate a single ring into a flat-triangle list. Returns true on success;
+	// false means the ring was degenerate (collinear, < 3 verts, zero area) and the
+	// caller should skip this polygon. Wraps FGeomTools2D::TriangulatePoly so callers
+	// don't have to deal with its idiosyncratic flat-vert output format directly.
+	static bool TriangulateRing(const TArray<FVector2D>& Ring, TArray<FVector2D>& OutTriVerts)
+	{
+		OutTriVerts.Reset();
+		if (Ring.Num() < 3) return false;
+		if (FMath::Abs(SignedAreaPx2(Ring)) < 1.0) return false; // ~1 pixel²; below this it's noise
+
+		// FGeomTools2D wants a CCW ring. Mapbox polygon outer rings are CW per MVT spec,
+		// so we reverse before triangulation.
+		TArray<FVector2D> CCW = Ring;
+		if (SignedAreaPx2(CCW) < 0.0)
+		{
+			Algo::Reverse(CCW);
+		}
+		return FGeomTools2D::TriangulatePoly(OutTriVerts, CCW, /*bKeepColinearVertices=*/false);
+	}
+}
+
+void UMapboxImporterConfig::GenerateWaterMeshesForChunk(ALandscapeProxy* Landscape,
+	const TArray<FCollectedPolygon>& Waters,
+	int32 LandscapeVerts,
+	double WorldSizePerLandscapeCm,
+	const FVector& ChunkOrigin)
+{
+#if WITH_EDITOR
+	if (!IsValid(Landscape) || Waters.IsEmpty()) return;
+
+	UWorld* World = Landscape->GetWorld();
+	const double CmPerLandscapePixel = WorldSizePerLandscapeCm / FMath::Max(1.0, (double)LandscapeVerts);
+
+	// Resolve water material once; fall back to engine default if user didn't pick one.
+	UMaterialInterface* Material = WaterMaterial.LoadSynchronous();
+
+	for (int32 PolyIdx = 0; PolyIdx < Waters.Num(); ++PolyIdx)
+	{
+		const FCollectedPolygon& Poly = Waters[PolyIdx];
+		if (Poly.Rings.Num() == 0) continue;
+		const TArray<FVector2D>& Outer = Poly.Rings[0];
+
+		// Triangulate the outer ring (holes ignored — water polygons in Mapbox rarely have
+		// holes at the zooms we use; islands in lakes are the rare exception and would need
+		// a constrained-Delaunay pass we're deferring).
+		TArray<FVector2D> TriVertsPx;
+		if (!TriangulateRing(Outer, TriVertsPx)) continue;
+
+		// Convert each triangulated vertex from landscape-pixel space to chunk-local cm.
+		// Z = average sampled terrain Z under the polygon's bounding box centre + the
+		// user-configured offset. Single Z per water plane keeps the mesh flat (a real lake
+		// surface is flat regardless of underlying terrain).
+		FBox2D BB(ForceInit);
+		for (const FVector2D& V : Outer) BB += V;
+		const FVector2D Centre = BB.GetCenter();
+		const double CentreWorldX = ChunkOrigin.X + Centre.X * CmPerLandscapePixel;
+		const double CentreWorldY = ChunkOrigin.Y + Centre.Y * CmPerLandscapePixel;
+		const double CentreWorldZ = SampleWorldZAtXY(World, ChunkOrigin, CentreWorldX, CentreWorldY)
+			+ (double)WaterPlaneZOffsetCm;
+		// All component-local coords are RELATIVE to the component's transform (attached
+		// to landscape origin), so the Z we store is the absolute world Z minus the
+		// component's world origin.Z. Component is created below at ChunkOrigin.
+		const double LocalZ = CentreWorldZ - ChunkOrigin.Z;
+
+		TArray<FVector> Verts;        Verts.Reserve(TriVertsPx.Num());
+		TArray<int32>   Tris;         Tris.Reserve(TriVertsPx.Num());
+		TArray<FVector> Normals;      Normals.Reserve(TriVertsPx.Num());
+		TArray<FVector2D> UV0;        UV0.Reserve(TriVertsPx.Num());
+		TArray<FProcMeshTangent> Tans; Tans.Reserve(TriVertsPx.Num());
+		for (int32 i = 0; i < TriVertsPx.Num(); ++i)
+		{
+			const FVector2D& Px = TriVertsPx[i];
+			Verts.Add(FVector(Px.X * CmPerLandscapePixel, Px.Y * CmPerLandscapePixel, LocalZ));
+			Tris.Add(i); // FGeomTools2D output is already a flat 3-per-tri list
+			Normals.Add(FVector::UpVector);
+			// UV unit per metre. 1 cm = 0.01 m; we want roughly 1 UV tile per metre.
+			UV0.Add(FVector2D(Verts.Last().X * 0.01, Verts.Last().Y * 0.01));
+			Tans.Add(FProcMeshTangent(1.f, 0.f, 0.f));
+		}
+
+		// Reverse winding if triangulation came out clockwise (water plane facing down).
+		// Cheap test: dot the first triangle's normal vs world up; flip the index list
+		// if it's negative.
+		if (Tris.Num() >= 3)
+		{
+			const FVector E1 = Verts[Tris[1]] - Verts[Tris[0]];
+			const FVector E2 = Verts[Tris[2]] - Verts[Tris[0]];
+			if (FVector::CrossProduct(E1, E2).Z < 0.f)
+			{
+				for (int32 t = 0; t + 2 < Tris.Num(); t += 3)
+				{
+					Swap(Tris[t + 1], Tris[t + 2]);
+				}
+			}
+		}
+
+		UProceduralMeshComponent* PMC = NewObject<UProceduralMeshComponent>(Landscape,
+			UProceduralMeshComponent::StaticClass(),
+			MakeUniqueObjectName(Landscape, UProceduralMeshComponent::StaticClass(),
+				*FString::Printf(TEXT("MapboxWater_%d"), PolyIdx)),
+			RF_Transactional);
+		if (!PMC) continue;
+		PMC->SetMobility(EComponentMobility::Static);
+		PMC->bUseAsyncCooking = false; // editor-time generation; sync is fine
+		PMC->SetupAttachment(Landscape->GetRootComponent());
+		PMC->RegisterComponent();
+		Landscape->AddInstanceComponent(PMC);
+
+		PMC->CreateMeshSection_LinearColor(0, Verts, Tris, Normals, UV0, /*VertexColors=*/{}, Tans,
+			/*bCreateCollision=*/false);
+		if (Material) PMC->SetMaterial(0, Material);
+		PMC->ComponentTags.AddUnique(TEXT("MapboxLandscape:Water"));
+	}
+#endif
+}
+
+void UMapboxImporterConfig::GenerateBuildingMeshesForChunk(ALandscapeProxy* Landscape,
+	const TArray<FCollectedPolygon>& Buildings,
+	int32 LandscapeVerts,
+	double WorldSizePerLandscapeCm,
+	const FVector& ChunkOrigin)
+{
+#if WITH_EDITOR
+	if (!IsValid(Landscape) || Buildings.IsEmpty()) return;
+
+	UWorld* World = Landscape->GetWorld();
+	const double CmPerLandscapePixel = WorldSizePerLandscapeCm / FMath::Max(1.0, (double)LandscapeVerts);
+	const double MetersPerLandscapePixel = CmPerLandscapePixel * 0.01;
+
+	UMaterialInterface* Material = BuildingMaterial.LoadSynchronous();
+	const float HeightMul = FMath::Max(0.01f, BuildingHeightMultiplier);
+	const float FallbackH = FMath::Max(1.f, DefaultBuildingHeightMeters);
+	const double MinAreaPx2 = (double)MinBuildingFootprintSquareMeters
+		/ FMath::Max(MetersPerLandscapePixel * MetersPerLandscapePixel, 1e-9);
+
+	int32 Skipped = 0;
+	for (int32 PolyIdx = 0; PolyIdx < Buildings.Num(); ++PolyIdx)
+	{
+		const FCollectedPolygon& Poly = Buildings[PolyIdx];
+		if (Poly.Rings.Num() == 0) continue;
+		const TArray<FVector2D>& Outer = Poly.Rings[0];
+		if (Outer.Num() < 3) continue;
+
+		// Skip noise polygons below the area threshold (garden sheds, mistagged points).
+		const double AreaPx2 = FMath::Abs(SignedAreaPx2(Outer));
+		if (AreaPx2 < MinAreaPx2) { ++Skipped; continue; }
+
+		// Roof cap triangulation.
+		TArray<FVector2D> RoofTriVertsPx;
+		if (!TriangulateRing(Outer, RoofTriVertsPx)) continue;
+
+		// Resolve height: data → fallback. min_height shifts the bottom up (tower-on-podium).
+		const float HMeters = (Poly.HeightMeters > 0.f ? Poly.HeightMeters : FallbackH) * HeightMul;
+		const float MinHMeters = FMath::Clamp(Poly.MinHeightMeters * HeightMul, 0.f, HMeters - 0.5f);
+		const double TopCm    = HMeters    * 100.0;
+		const double BottomCm = MinHMeters * 100.0;
+
+		// Sample one terrain Z under the footprint centre; whole building sits on that Z so
+		// the base is flat (a real building doesn't follow micro terrain variation under it).
+		FBox2D BB(ForceInit);
+		for (const FVector2D& V : Outer) BB += V;
+		const FVector2D Centre = BB.GetCenter();
+		const double CentreWorldX = ChunkOrigin.X + Centre.X * CmPerLandscapePixel;
+		const double CentreWorldY = ChunkOrigin.Y + Centre.Y * CmPerLandscapePixel;
+		const double GroundWorldZ = SampleWorldZAtXY(World, ChunkOrigin, CentreWorldX, CentreWorldY);
+		const double GroundLocalZ = GroundWorldZ - ChunkOrigin.Z;
+
+		// ---- Build the mesh ----
+		// Layout: roof verts first (one per triangulated vert, all at TopCm), then per-edge
+		// wall quads (4 verts each). Index buffer concatenates roof tri list + wall tri lists.
+		TArray<FVector> Verts;
+		TArray<int32>   Tris;
+		TArray<FVector> Normals;
+		TArray<FVector2D> UV0;
+		TArray<FProcMeshTangent> Tans;
+
+		// Roof: all triangulated verts at TopCm with normal Up.
+		const int32 RoofBase = Verts.Num();
+		for (const FVector2D& Px : RoofTriVertsPx)
+		{
+			Verts.Add(FVector(Px.X * CmPerLandscapePixel, Px.Y * CmPerLandscapePixel, GroundLocalZ + TopCm));
+			Normals.Add(FVector::UpVector);
+			UV0.Add(FVector2D(Px.X * CmPerLandscapePixel * 0.01, Px.Y * CmPerLandscapePixel * 0.01));
+			Tans.Add(FProcMeshTangent(1.f, 0.f, 0.f));
+		}
+		// Roof winding: ensure CCW when seen from above. TriangulateRing produced a flat
+		// 3-per-tri list and we forced CCW before triangulating, so this should already be
+		// correct — but defensively flip if the first tri's signed area is negative.
+		bool bFlipRoofWinding = false;
+		if (RoofTriVertsPx.Num() >= 3)
+		{
+			const FVector2D& A = RoofTriVertsPx[0];
+			const FVector2D& B = RoofTriVertsPx[1];
+			const FVector2D& C = RoofTriVertsPx[2];
+			const double SignedTri = (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X);
+			bFlipRoofWinding = (SignedTri < 0.0);
+		}
+		for (int32 t = 0; t < RoofTriVertsPx.Num(); t += 3)
+		{
+			Tris.Add(RoofBase + t + 0);
+			Tris.Add(RoofBase + (bFlipRoofWinding ? t + 2 : t + 1));
+			Tris.Add(RoofBase + (bFlipRoofWinding ? t + 1 : t + 2));
+		}
+
+		// Walls: one quad per outer-ring edge. The outer ring's last vertex equals the first
+		// in MVT polygon encoding, so iterating [0..N-1] with the wrap edge picks up all
+		// distinct edges. Wall normals are computed per-edge so adjacent walls aren't smoothed
+		// (each face stays flat — wanted for buildings, not for terrain).
+		const int32 N = Outer.Num();
+		// Trim the wrap-duplicate vertex if MVT included it explicitly.
+		const int32 EdgeCount = (N >= 2 && Outer[0].Equals(Outer.Last(), 0.001f)) ? N - 1 : N;
+		for (int32 e = 0; e < EdgeCount; ++e)
+		{
+			const FVector2D& A = Outer[e];
+			const FVector2D& B = Outer[(e + 1) % EdgeCount];
+			if (A.Equals(B, 0.001f)) continue;
+
+			const FVector PA(A.X * CmPerLandscapePixel, A.Y * CmPerLandscapePixel, 0.0);
+			const FVector PB(B.X * CmPerLandscapePixel, B.Y * CmPerLandscapePixel, 0.0);
+			FVector Edge = (PB - PA); Edge.Z = 0.f;
+			const double EdgeLenCm = Edge.Size();
+			if (EdgeLenCm < 1.0) continue; // < 1 cm edge — skip
+
+			// Outward normal: rotate edge 90° clockwise in XY. For CW rings (Mapbox default),
+			// this points outside the polygon. We'll detect ring CW/CCW and flip if needed.
+			FVector OutNormal(Edge.Y, -Edge.X, 0.0);
+			OutNormal.Normalize();
+			// If the ring is CCW (uncommon for MVT but possible after reversal upstream),
+			// flip so the wall faces outward.
+			if (SignedAreaPx2(Outer) > 0.0) OutNormal *= -1.0;
+
+			const int32 Base = Verts.Num();
+			// Quad vertices: bottom-A, bottom-B, top-B, top-A.
+			Verts.Add(FVector(PA.X, PA.Y, GroundLocalZ + BottomCm));
+			Verts.Add(FVector(PB.X, PB.Y, GroundLocalZ + BottomCm));
+			Verts.Add(FVector(PB.X, PB.Y, GroundLocalZ + TopCm));
+			Verts.Add(FVector(PA.X, PA.Y, GroundLocalZ + TopCm));
+			for (int32 v = 0; v < 4; ++v)
+			{
+				Normals.Add(OutNormal);
+				Tans.Add(FProcMeshTangent(Edge.X / EdgeLenCm, Edge.Y / EdgeLenCm, 0.f));
+			}
+			// UVs: U follows the edge (1 unit per metre), V follows height (1 unit per metre).
+			const double EdgeLenM = EdgeLenCm * 0.01;
+			const double WallHM = (TopCm - BottomCm) * 0.01;
+			UV0.Add(FVector2D(0.f,        WallHM));
+			UV0.Add(FVector2D(EdgeLenM,   WallHM));
+			UV0.Add(FVector2D(EdgeLenM,   0.f));
+			UV0.Add(FVector2D(0.f,        0.f));
+			// Two CCW tris facing OutNormal: (Base, Base+1, Base+2) and (Base, Base+2, Base+3).
+			Tris.Add(Base + 0); Tris.Add(Base + 1); Tris.Add(Base + 2);
+			Tris.Add(Base + 0); Tris.Add(Base + 2); Tris.Add(Base + 3);
+		}
+
+		if (Verts.Num() == 0 || Tris.Num() == 0) continue;
+
+		UProceduralMeshComponent* PMC = NewObject<UProceduralMeshComponent>(Landscape,
+			UProceduralMeshComponent::StaticClass(),
+			MakeUniqueObjectName(Landscape, UProceduralMeshComponent::StaticClass(),
+				*FString::Printf(TEXT("MapboxBuilding_%d"), PolyIdx)),
+			RF_Transactional);
+		if (!PMC) continue;
+		PMC->SetMobility(EComponentMobility::Static);
+		PMC->bUseAsyncCooking = false;
+		PMC->SetupAttachment(Landscape->GetRootComponent());
+		PMC->RegisterComponent();
+		Landscape->AddInstanceComponent(PMC);
+
+		PMC->CreateMeshSection_LinearColor(0, Verts, Tris, Normals, UV0, /*VertexColors=*/{}, Tans,
+			/*bCreateCollision=*/true);
+		if (Material) PMC->SetMaterial(0, Material);
+		PMC->ComponentTags.AddUnique(TEXT("MapboxLandscape:Building"));
+	}
+
+	if (Skipped > 0)
+	{
+		UE_LOG(LogMapbox, Log, TEXT("Mapbox: buildings — skipped %d polygon(s) below minimum footprint (%.0f m²)."),
+			Skipped, MinBuildingFootprintSquareMeters);
+	}
+#endif
 }

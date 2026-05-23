@@ -139,6 +139,32 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features", meta = (ToolTip = "If on, the editor's small mountain-shaped sprite icons that mark every landscape spline control point get hidden after population. Highly recommended — a city's worth of icons tile-fills the viewport and crushes editor performance. You can still edit splines via Landscape Mode > Spline; the icons aren't needed for selection."))
 	bool bHideSplineEditorSprites = true;
 
+	// --- Water bodies ---
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Water", meta = (ToolTip = "Tick to generate flat water-plane meshes from Mapbox `water` polygons (lakes, rivers, coast) when you run Populate World Features. One UProceduralMeshComponent per polygon, attached to the matching landscape actor."))
+	bool bPopulateWater = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Water", meta = (EditCondition = "bPopulateWater", ToolTip = "Material applied to every water plane. Should be translucent / use the engine's water shading. Leave empty to use the engine default material (unlit grey) — fine for a flat-shaded preview, ugly for a final render. Tip: assign Water/M_Water_LakeRiver from the Water plugin's content if installed."))
+	TSoftObjectPtr<class UMaterialInterface> WaterMaterial;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Water", meta = (EditCondition = "bPopulateWater", ClampMin = "-1000", ClampMax = "1000", ToolTip = "Vertical offset applied to every water plane, in cm. Mapbox `water` polygons have no Z attribute, so we place them at the average landscape Z under the polygon and then offset by this amount. Slight negative (-50 cm) is usually best so the plane sinks below shoreline pixels and looks contained."))
+	float WaterPlaneZOffsetCm = -50.f;
+
+	// --- Buildings ---
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Buildings", meta = (ToolTip = "Tick to generate extruded building meshes from Mapbox `building` polygons. Each polygon becomes a UProceduralMeshComponent with footprint walls + a flat roof. Footprint comes from the geometry; height comes from the MVT `height` property (or `min_height` for tower-on-podium), with a fallback when the property is missing."))
+	bool bPopulateBuildings = true;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Buildings", meta = (EditCondition = "bPopulateBuildings", ClampMin = "1", ClampMax = "200", ToolTip = "Fallback height (m) used when a `building` feature has no `height` property — common for rural OSM data and any tile-set that doesn't expose 3-D building data. Realistic city default: 8 m (~2 storeys)."))
+	float DefaultBuildingHeightMeters = 8.f;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Buildings", meta = (EditCondition = "bPopulateBuildings", ClampMin = "0.1", ClampMax = "5.0", ToolTip = "Multiplier on every building's height (real or fallback). Useful for stylisation or to compensate for tile-sets that underreport storey height. 1.0 = trust the data."))
+	float BuildingHeightMultiplier = 1.f;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Buildings", meta = (EditCondition = "bPopulateBuildings", ToolTip = "Material applied to every generated building. Set to a tile-able wall material for best results; leaving empty uses the engine default (unlit grey). Roof and walls share this material — assignable separately later if needed."))
+	TSoftObjectPtr<class UMaterialInterface> BuildingMaterial;
+
+	UPROPERTY(EditAnywhere, Category = "Mapbox|World Features|Buildings", meta = (EditCondition = "bPopulateBuildings", ClampMin = "5", ClampMax = "10000", ToolTip = "Skip any building whose footprint is smaller than this in square meters. OSM data has lots of garden-shed-sized noise polygons that aren't worth meshing. 25 m² (a small kiosk) is a reasonable filter."))
+	float MinBuildingFootprintSquareMeters = 25.f;
+
 	UPROPERTY(EditAnywhere, Category = "Mapbox|World Partition", meta = (ToolTip = "If on AND the current level is World Partition, automatically convert imported chunks into spatially-loaded streaming proxies at the end of fetch (same op as Build > World Partition > Convert Landscape, just chained). WP then unloads distant proxies for low resident memory. Costs significant fetch time because each component gets its heightmap split into a per-component texture. Turn off if you want a fast fetch and will run the manual Convert Generated Landscapes To Streaming action later (or don't need streaming)."))
 	bool bConvertToWorldPartitionStreaming = true;
 
@@ -291,6 +317,36 @@ private:
 	                                 double WorldSizePerLandscapeCm,
 	                                 double LandscapeZScale,
 	                                 const FVector& ChunkOrigin);
+
+	/** One polygon collected from the MVT parse pass — either a water body or a building footprint.
+	 *  Coords are in landscape-pixel space (same as FCollectedRoadPolyline). Rings holds one or more
+	 *  rings per MVT feature; ring[0] is the outer, subsequent rings are holes. HeightMeters is the
+	 *  feature's `height` property when present (buildings only); -1 means "use the fallback". */
+	struct FCollectedPolygon
+	{
+		TArray<TArray<FVector2D>> Rings;
+		float HeightMeters = -1.f;
+		float MinHeightMeters = 0.f;
+	};
+
+	/** Build flat water-plane meshes via UProceduralMeshComponent, one component per polygon.
+	 *  Triangulates the outer ring (holes ignored for v1 — Mapbox water polygons are rarely
+	 *  multiring at the zooms we use), places at average terrain Z under the footprint + the
+	 *  user's WaterPlaneZOffsetCm, applies WaterMaterial. */
+	void GenerateWaterMeshesForChunk(ALandscapeProxy* Landscape,
+	                                 const TArray<FCollectedPolygon>& Waters,
+	                                 int32 LandscapeVerts,
+	                                 double WorldSizePerLandscapeCm,
+	                                 const FVector& ChunkOrigin);
+
+	/** Build extruded building meshes via UProceduralMeshComponent, one component per polygon.
+	 *  Triangulates the outer ring for the roof cap; emits quad walls from each footprint edge.
+	 *  Footprint area-filter and height resolution (data → default → multiplier) happen here. */
+	void GenerateBuildingMeshesForChunk(ALandscapeProxy* Landscape,
+	                                    const TArray<FCollectedPolygon>& Buildings,
+	                                    int32 LandscapeVerts,
+	                                    double WorldSizePerLandscapeCm,
+	                                    const FVector& ChunkOrigin);
 
 	void EnsureDefaultLayers();
 	void FinishFetch();
